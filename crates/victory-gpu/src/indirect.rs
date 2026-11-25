@@ -269,7 +269,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, 0).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -289,7 +289,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, AHEAD).then_some(dst)
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
@@ -311,13 +311,48 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget()?);
     let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
 }
 
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
+/// Whether a clamp leaves the list's scratch buffer readable as indirect
+/// arguments until the next clamp into it (`VICTORY_INDIRECT_KEEP=1`; off
+/// by default), instead of each execution moving it back to the common
+/// state after it. Off, every indirect execution is followed by that
+/// transition, which drivers may treat as a full wait: with
+/// `VICTORY_INDIRECT_WINDOW=1` the draws of a window still had a barrier
+/// between each two (after avatarmanz/VIctory-7900XTX cc11ccc).
+pub(crate) fn keep_readable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
+/// the list left it in ([`keep_readable`]).
+#[allow(clippy::too_many_arguments)]
+fn clamp_into(
+    list: &HostList,
+    c: &Clamp,
+    dst: &ID3D12Resource,
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    how: u32,
+) -> bool {
+    let before = list.indirect_state(dst);
+    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, how);
+    if recorded && keep_readable() {
+        list.indirect_readable(dst);
+    }
+    recorded
+}
+
+/// The clamp from the common state (the tests' form).
+#[cfg(test)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -327,17 +362,18 @@ fn record_clamp(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    record_clamp_as(c, l, (dst, D3D12_RESOURCE_STATE_COMMON), budget, src, count, spec, 0)
 }
 
-/// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
+/// Records the clamp into `dst`, which is in state `before`, leaving it in
+/// `INDIRECT_ARGUMENT`; `how`: [`AHEAD`], the records are a window clamped
 /// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
 /// parts ([`bound_split`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -402,11 +438,7 @@ fn record_clamp_as(
     let waits = true;
     let first = [
         uav_barrier(),
-        transition(
-            dst,
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        ),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     ];
     let second = [
         uav_barrier(),
@@ -437,7 +469,12 @@ fn record_clamp_as(
 
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
+/// With [`keep_readable`] nothing: the buffer stays readable, and the
+/// next clamp (or the list's close) moves it.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if keep_readable() {
+        return;
+    }
     done_on(&list.list, scratch);
 }
 
@@ -1134,7 +1171,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
@@ -1187,7 +1224,7 @@ void main() {
             assert!(record_clamp_as(
                 &warp.clamp,
                 &warp.list,
-                &dst_buf,
+                (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
                 budget_gpu,
                 (&src_buf, 0),
                 None,
