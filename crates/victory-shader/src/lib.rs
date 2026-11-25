@@ -58,6 +58,7 @@ translation_inputs! {
     "emit/bitcode.rs",
     "emit/bitcode/census.rs",
     "emit/bitcode/opt.rs",
+    "emit/bitcode/viewid.rs",
     "emit/container.rs",
     "emit/guest_address.rs",
     "emit/intersect.rs",

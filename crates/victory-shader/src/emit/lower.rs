@@ -129,6 +129,30 @@ pub(super) fn lower_program(
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+/// `s_sendmsg` id ending a primitive-ordered pixel shader's ordered section.
+const ORDERED_PS_DONE: u16 = 7;
+/// Operand code of `src_pops_exiting_wave_id`.
+const POPS_EXITING_WAVE_ID: u8 = 239;
+/// `HW_REG_POPS_PACKER`, the hardware register a POPS program picks its
+/// packer with.
+const HW_REG_POPS_PACKER: u16 = 25;
+
+/// A primitive-ordered pixel shader (POPS): it waits for the overlapping
+/// waves before it to leave their ordered section (`src_pops_exiting_wave_id`
+/// against its collision SGPR), picks its packer (`HW_REG_POPS_PACKER`) and
+/// ends its own with `MSG_ORDERED_PS_DONE`. The host has no such wait: the
+/// program's storage writes go through rasterizer-ordered views instead,
+/// which give each pixel's accesses in primitive order as the section did.
+pub(crate) fn pops_program(p: &crate::ir::Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| match &i.fields {
+        Fields::Sopp { imm } => i.name() == "s_sendmsg" && imm & 0xF == ORDERED_PS_DONE,
+        Fields::Sop { src, imm, .. } => {
+            src.iter().any(|o| matches!(o, Operand::Const(POPS_EXITING_WAVE_ID)))
+                || (i.name().starts_with("s_setreg") && imm.is_some_and(|m| m & 0x3F == HW_REG_POPS_PACKER))
+        }
+        _ => false,
+    })
+}
 
 /// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
 /// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
@@ -1267,6 +1291,9 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        // A primitive-ordered pixel shader's storage goes through
+        // rasterizer-ordered views (`pops_program`).
+        s.rov = s.pixel && pops_program(x.p);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -2333,6 +2360,13 @@ impl<'a> Lower<'a> {
                     // paths only seem to allow it before any save: the lane of a VGPR
                     // nobody wrote, and VGPRs nobody set read as zero.
                     None if n >= crate::ir::PARKED => Val::I32(self.s.m.i32(0)),
+                    // A primitive-ordered pixel shader's collision SGPR (POPS:
+                    // bit 31 an overlapped earlier wave, bits 25:16 this wave's
+                    // id, 9:0 the newest overlapped one). Zero is "no wave to
+                    // wait for": the program skips its wait for its turn, and
+                    // the ordering comes from the host's rasterizer-ordered
+                    // views instead (`pops_program`).
+                    None if self.s.pixel && pops_program(self.x.p) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
@@ -3244,6 +3278,9 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
+            // `src_pops_exiting_wave_id`: read only in a POPS program's wait for
+            // its turn, which its zero collision SGPR skips (`pops_program`).
+            Operand::Const(POPS_EXITING_WAVE_ID) if self.s.pixel => Ok(self.s.m.i32(0)),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),

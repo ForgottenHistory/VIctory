@@ -90,6 +90,8 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// Rasterizer-ordered views.
+    pub const ROVS: u64 = 1 << 18;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -151,6 +153,8 @@ pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
     pub pixel: bool,
+    /// Every UAV handle is a rasterizer-ordered view (a POPS pixel shader).
+    pub rov: bool,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     /// A mesh shader's per-primitive outputs.
@@ -267,6 +271,7 @@ impl Shader {
                 res_ret,
             },
             pixel,
+            rov: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
             prims: Vec::new(),
@@ -459,6 +464,13 @@ impl Shader {
     }
 
     pub fn annotate(&mut self, block: usize, h: V, props0: u32, props1: u32) -> V {
+        // ResourceProperties: bit 12 a UAV, bit 13 rasterizer ordered.
+        let props0 = if self.rov && props0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            props0 | 0x2000
+        } else {
+            props0
+        };
         let p = [self.m.i32(props0), self.m.i32(props1)];
         let p = self.m.aggregate(self.t.props, &p);
         self.op(
@@ -741,9 +753,20 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        let base = |els: &[SigElement]| -> Vec<Option<u32>> {
+            els.iter()
+                .map(|e| e.row.map(|r| r * 4 + u32::from(e.col)))
+                .collect()
+        };
+        let deps = if graphics && self.mesh.is_none() {
+            self.m
+                .view_dependencies(&base(&self.inputs), &base(&self.outputs))
+        } else {
+            Vec::new()
+        };
         if graphics {
-            // shortcut: every output is declared to depend on every input; the
-            // exact sets need a dependence pass. Drivers read this state.
+            // Which outputs depend on which inputs, as the validator works
+            // it out from the code (it wants exactly those sets).
             let scalars = |els: &[SigElement]| {
                 els.iter()
                     .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
@@ -756,13 +779,15 @@ impl Shader {
             if self.mesh.is_some() {
                 view.push(scalars(&self.prims));
             }
-            for _ in 0..ni {
+            for i in 0..ni {
+                let mask = deps.get(i as usize).copied().unwrap_or(0);
                 for k in 0..no.div_ceil(32) {
                     let bits = (no - 32 * k).min(32);
+                    let word = (mask >> (32 * k)) as u32;
                     view.push(if bits == 32 {
-                        u32::MAX
+                        word
                     } else {
-                        (1 << bits) - 1
+                        word & ((1 << bits) - 1)
                     });
                 }
             }
@@ -884,6 +909,9 @@ impl Shader {
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
+        }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }
@@ -927,6 +955,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            deps: &deps,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

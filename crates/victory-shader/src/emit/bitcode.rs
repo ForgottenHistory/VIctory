@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
+mod viewid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -549,6 +550,65 @@ impl Module {
         live
     }
 
+    /// The blocks as written, in order (reachable ones in reverse
+    /// postorder, folded latches left out), and for each folded latch its
+    /// one predecessor and its loop header.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn layout(&self) -> (Vec<usize>, Vec<Option<(usize, usize)>>) {
+        // Blocks are laid out in reverse postorder, so every block follows
+        // its forward predecessors (drivers take a branch to an earlier
+        // block for a loop's back edge).
+        let succs = |b: usize| successors(self.blocks[b].term);
+        let mut seen = vec![false; self.blocks.len()];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![u64::MAX; self.blocks.len()];
+        for (n, &b) in post.iter().enumerate() {
+            pos[b] = n as u64;
+        }
+        // An empty latch (only a branch back to its loop header) is folded
+        // into its one predecessor, so the exiting block is the latch as in
+        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for &b in &post {
+            for &s in succs(b).iter() {
+                preds[s].push(b);
+            }
+        }
+        let mut fold = vec![None; self.blocks.len()];
+        for &b in &post {
+            let blk = &self.blocks[b];
+            if let (Some(Term::Br(h)), true, [p]) = (
+                blk.term,
+                blk.phis.is_empty() && blk.body.is_empty(),
+                &preds[b][..],
+            ) && pos[h] < pos[b]
+                && !succs(*p).contains(&h)
+            {
+                fold[b] = Some((*p, h));
+            }
+        }
+        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        (layout, fold)
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");
@@ -685,57 +745,7 @@ impl Module {
         // Phis nothing reads are left out (one register per phi makes many).
         let live = self.live();
 
-        // Blocks are laid out in reverse postorder, so every block follows
-        // its forward predecessors (drivers take a branch to an earlier
-        // block for a loop's back edge).
-        let succs = |b: usize| successors(self.blocks[b].term);
-        let mut seen = vec![false; self.blocks.len()];
-        let mut post = Vec::new();
-        let mut stack = vec![(0usize, 0usize)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, k) = *top;
-            top.1 += 1;
-            match succs(b).get(k) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        let mut pos = vec![u64::MAX; self.blocks.len()];
-        for (n, &b) in post.iter().enumerate() {
-            pos[b] = n as u64;
-        }
-        // An empty latch (only a branch back to its loop header) is folded
-        // into its one predecessor, so the exiting block is the latch as in
-        // DXC's loops; the AMD driver hangs on divergent loops otherwise.
-        let mut preds = vec![Vec::new(); self.blocks.len()];
-        for &b in &post {
-            for &s in succs(b).iter() {
-                preds[s].push(b);
-            }
-        }
-        let mut fold = vec![None; self.blocks.len()];
-        for &b in &post {
-            let blk = &self.blocks[b];
-            if let (Some(Term::Br(h)), true, [p]) = (
-                blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
-                &preds[b][..],
-            ) && pos[h] < pos[b]
-                && !succs(*p).contains(&h)
-            {
-                fold[b] = Some((*p, h));
-            }
-        }
-        let layout: Vec<usize> = post.into_iter().filter(|&b| fold[b].is_none()).collect();
+        let (layout, fold) = self.layout();
         let mut pos = vec![u64::MAX; self.blocks.len()];
         for (n, &b) in layout.iter().enumerate() {
             pos[b] = n as u64;

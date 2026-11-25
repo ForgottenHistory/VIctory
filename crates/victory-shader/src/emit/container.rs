@@ -161,6 +161,8 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// For each input scalar, the output scalars that depend on it.
+    pub deps: &'a [u128],
 }
 
 /// `PSV0` with runtime info version 2 (validator 1.6).
@@ -235,15 +237,12 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
+        // Each element's name is written anew, as DXC does: the validator
+        // wants the same table, so equal names are not shared.
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(e.name.bytes().chain([0]));
+            at
         } else {
             0
         };
@@ -272,38 +271,17 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend([1, start, cols, e.kind, e.sig_comp() as u8, e.interp, 0, 0]);
         }
     }
-    // Input-to-output dependencies, as the view-id state declares them:
-    // every output scalar on every input scalar.
+    // Input-to-output dependencies, as the view-id state declares them.
     if in_vectors > 0 && out_vectors > 0 {
-        let scalars = |els: &[SigElement]| {
-            els.iter()
-                .filter_map(|e| e.row.map(|r| r * 4 + u32::from(e.col + e.cols)))
-                .max()
-                .unwrap_or(0)
-        };
-        let (ni, no) = (scalars(p.inputs), scalars(p.outputs));
         let per = (out_vectors * 4).div_ceil(32);
         for i in 0..in_vectors * 4 {
+            let mask = p.deps.get(i as usize).copied().unwrap_or(0);
             for k in 0..per {
-                let bits = if i < ni {
-                    no.saturating_sub(32 * k).min(32)
-                } else {
-                    0
-                };
-                let mask = if bits == 32 {
-                    u32::MAX
-                } else {
-                    (1u32 << bits) - 1
-                };
-                u32s(&mut out, &[mask]);
+                u32s(&mut out, &[(mask >> (32 * k)) as u32]);
             }
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -446,6 +424,7 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
+            deps: &[],
         });
         recovered[1].interp = 2;
         super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();

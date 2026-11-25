@@ -390,8 +390,14 @@ fn translate(
         return t.fail("corrupt record".into(), example);
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
-    // "shader does not translate", "host pipeline refused").
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // "shader does not translate", "host pipeline refused"): of the container
+    // alone, as the title passes it and `warm` hashes it, without what follows
+    // it in its record.
+    let total = bytes
+        .get(0x18..0x1c)
+        .and_then(|b| b.try_into().ok())
+        .map_or(bytes.len(), |b| u32::from_le_bytes(b) as usize);
+    let hash = blake3::hash(&bytes[..total.min(bytes.len())]).to_hex()[..16].to_owned();
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
