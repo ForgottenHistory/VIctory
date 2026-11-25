@@ -183,6 +183,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
+    victory_profile::zone!("sweep");
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
@@ -924,6 +925,7 @@ impl PlannedPrelude {
 }
 
 fn record_preludes(plans: Vec<PlannedPrelude>) {
+    victory_profile::zone!("record preludes");
     // Dispatch overhead exceeds recording cost for small batches of
     // transitions. A depth-twin copy can record several D3D12 commands.
     let barrier_count: usize = plans.iter()
@@ -2483,6 +2485,7 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+    victory_profile::zone!("late blocked check");
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -3135,6 +3138,7 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList], card_only: bool) -> Vec<Declared> {
+    victory_profile::zone!("declared writes");
     let mut back = WriteGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -3366,6 +3370,7 @@ mod landings_tests {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
+    victory_profile::zone!("hand back shader writes");
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -5633,6 +5638,7 @@ impl HostList {
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
     fn plan_prelude(&self) -> Option<PlannedPrelude> {
+        victory_profile::zone!("plan prelude");
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
