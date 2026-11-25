@@ -189,6 +189,20 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
     (size / PIECE as u64 + 2) * 64 * 16
 }
 
+/// Experiment (`VICTORY_CARD_ROOM_PERCENT`, 50 to 100, default 80): the
+/// share of the card's budget up to which a title buffer still gets a copy
+/// in the card's memory. Buffers are what shaders read most; at 80 they
+/// lose the race with textures whenever textures fill the card first.
+fn card_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |percent| percent.clamp(50, 100))
+    })
+}
+
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
@@ -212,7 +226,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     // them, so the card's use stays where it was and the textures' share
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * card_room_percent()
     {
         return None;
     }
@@ -267,7 +281,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * card_room_percent()
     {
         return None;
     }
