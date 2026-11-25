@@ -62,6 +62,8 @@ mod watch;
 #[cfg(windows)]
 mod writeback;
 #[cfg(windows)]
+mod unwritten;
+#[cfg(windows)]
 mod texback;
 
 #[cfg(windows)]

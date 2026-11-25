@@ -204,6 +204,8 @@ impl Owners {
         let Some(end) = address.checked_add(data.len()) else {
             return 0;
         };
+        // Shaders wrote here (`crate::unwritten`).
+        crate::unwritten::written(address, data.len());
         let range = address..end;
         // A backing change cannot race the check and the actual CPU write.
         let _mapped = crate::watch::title_memory_reading_range(range.clone());

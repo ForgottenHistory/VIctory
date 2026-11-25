@@ -2555,7 +2555,19 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if written.touches(src, src + len) || written.touches(dst, dst + len) {
+                    let src_hit = written.touches(src, src + len);
+                    let dst_hit = written.touches(dst, dst + len);
+                    if src_hit || dst_hit {
+                        // Where the card is seen never to write, no wait
+                        // (`crate::unwritten`).
+                        let learned = (!src_hit || crate::unwritten::unwritten(src, src + len))
+                            && (!dst_hit || crate::unwritten::unwritten(dst, dst + len));
+                        if learned {
+                            if count {
+                                crate::unwritten::went_ahead();
+                            }
+                            continue;
+                        }
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
@@ -2565,7 +2577,18 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                     }
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    if let Some(f) = step.fills().iter().find(|f| written.touches(f.src, f.src.saturating_add(f.len))) {
+                    if let Some(f) = step.fills().iter().find(|f| {
+                        let (from, to) = (f.src, f.src.saturating_add(f.len));
+                        written.touches(from, to) && {
+                            // Where the card is seen never to write, no
+                            // wait (`crate::unwritten`).
+                            let learned = crate::unwritten::unwritten(from, to);
+                            if learned && count {
+                                crate::unwritten::went_ahead();
+                            }
+                            !learned
+                        }
+                    }) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             note_fill_block(f.src, f.len, written);
@@ -2971,6 +2994,7 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    crate::unwritten::report(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4008,6 +4032,24 @@ impl Host {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     (0..r.span.pieces).map(move |p| (copy, r.span.first + p, r.changed_pages(p, differs)))
                 }));
+                // What the card's compare saw, piece by piece
+                // (`crate::unwritten`).
+                if crate::unwritten::on() {
+                    let (mut seen, mut uncompared) = (Vec::new(), Vec::new());
+                    for r in &plan.ranges {
+                        if !r.compared {
+                            uncompared.push(r.declared);
+                            continue;
+                        }
+                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                        let start = r.shadow.title_start();
+                        for p in 0..r.span.pieces {
+                            let changed = fetched.get(&(copy, r.span.first + p)).is_some_and(|&m| m != 0);
+                            seen.push((r.span.title_piece(start, p), changed));
+                        }
+                    }
+                    crate::unwritten::landed(&seen, &uncompared);
+                }
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {

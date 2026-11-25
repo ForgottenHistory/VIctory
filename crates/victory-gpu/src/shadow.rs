@@ -388,6 +388,12 @@ impl CardSpan {
     /// Consecutive dirty 4 KiB pages within one 64 KiB piece, clipped to
     /// the declared byte range. The compare uses guest page boundaries,
     /// even when the copy's first byte lies partway through a guest page.
+    /// The title piece (64 KiB of title memory) of the copy starting at
+    /// `start` that holds this span's piece `piece`.
+    pub(crate) fn title_piece(&self, start: u64, piece: u32) -> usize {
+        start as usize / PIECE + (self.first + piece) as usize
+    }
+
     pub(crate) fn changed_ranges(&self, piece: u32, mask: u16) -> impl Iterator<Item = (usize, usize)> {
         let base = (self.first + piece) as usize * PIECE;
         let mut remaining = u32::from(mask);
@@ -1784,6 +1790,11 @@ impl Shadow {
     }
 
     /// The copy's own number (see the field).
+    /// The title address the copy starts at.
+    pub(crate) fn title_start(&self) -> u64 {
+        self.start
+    }
+
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
