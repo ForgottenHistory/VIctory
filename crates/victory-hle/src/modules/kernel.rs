@@ -294,6 +294,25 @@ pub extern "C" fn terminate() -> ! {
     host::abort()
 }
 
+/// The UCRT's `_register_thread_local_exe_atexit_callback`, which an exe's
+/// CRT start-up calls with its `__dyn_tls_dtor` so that its `thread_local`
+/// destructors run at exit. The UCRT takes one such callback per process and
+/// terminates on a second, and the host exe may hold it already: its own CRT
+/// registers one when it has C++ `thread_local`s with destructors (the Tracy
+/// client of a `profile` build). The title exe, mapped as a DLL, would then
+/// end the process in its start-up.
+///
+/// The same `__dyn_tls_dtor` is one of the title exe's TLS callbacks, which
+/// the loader runs on process detach as Windows would
+/// (`victory_loader::threads::detach_all`); that is where its destructors
+/// run, once. So the callback is only noted here.
+pub extern "C" fn _register_thread_local_exe_atexit_callback(callback: usize) {
+    tracing::debug!(
+        callback = format_args!("{callback:#x}"),
+        "the title's thread_local destructors: run with its TLS callbacks on process detach"
+    );
+}
+
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     let from = host::callers();
@@ -428,6 +447,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(abort),
             hle_export!(terminate),
             hle_export!(_invalid_parameter_noinfo_noreturn),
+            hle_export!(_register_thread_local_exe_atexit_callback),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
         ],
