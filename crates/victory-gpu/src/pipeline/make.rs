@@ -135,6 +135,7 @@ impl Pending {
     }
 
     fn make(&self) {
+        victory_profile::zone!("make host pipeline");
         let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));

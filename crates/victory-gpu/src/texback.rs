@@ -110,6 +110,7 @@ pub(crate) fn add_destination_aliases(ranges: &mut Vec<(usize, usize)>) {
 /// Records into `list` the copy of `texture` (title resource `resource`'s
 /// host copy, in the copy-source state) into a read-back buffer.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource::ResourceRef, texture: &ID3D12Resource) -> Option<Back> {
+    victory_profile::zone!("texture readback record");
     let host = crate::host::host()?;
     let resource = retained.as_ptr();
     let (layout, at, size) = crate::resource::title_texture(resource)?;
@@ -168,6 +169,7 @@ pub(crate) static COPIED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// Once the list that recorded `back` has run: its texels, tiled into the
 /// title's layout, into the texture's title memory.
 pub(crate) fn land(back: &Back) {
+    victory_profile::zone!("texture readback land");
     let Some(_mapping) = back.mapping.for_write() else { return };
     let mut tiled = vec![0u8; back.size];
     // Bytes of title memory the subresources do not cover stay as they are.

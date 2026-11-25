@@ -79,6 +79,7 @@ pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    victory_profile::zone!("title fence SetEventOnCompletion");
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -123,6 +124,7 @@ pub(crate) fn set(this: This, value: u64) {
     });
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    victory_profile::zone!("fence signal");
     set(this, value);
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]

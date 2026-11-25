@@ -407,6 +407,7 @@ unsafe impl Sync for CardClock {}
 /// The clock's thread: waits for the newest signal sent and notes when the
 /// card got there with nothing newer behind it.
 fn card_clock_watch(clock: &'static CardClock) {
+    victory_profile::thread_name("victory card clock");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         return;
@@ -2617,6 +2618,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    victory_profile::thread_name("victory late helper");
     let Some(host) = host() else {
         return;
     };
@@ -2739,6 +2741,7 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    victory_profile::thread_name("victory relay");
     let Some(host) = host() else {
         return;
     };
@@ -3578,6 +3581,7 @@ impl Host {
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+        victory_profile::zone!("card before (copies to card)");
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3836,6 +3840,7 @@ impl Host {
         fetch: &mut Option<RelayFetch>,
         owners: &crate::writeback::Owners,
     ) {
+        victory_profile::zone!("relay card back");
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -4075,6 +4080,7 @@ impl Host {
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
         owners: &crate::writeback::Owners,
     ) {
+        victory_profile::zone!("card back (wait, copy back)");
         if plan.ranges.is_empty() {
             return;
         }
@@ -4331,6 +4337,7 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
+        victory_profile::zone!("settle (wait for card)");
         if !late() {
             return;
         }
@@ -4471,6 +4478,7 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, mut runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent, usize)> {
+        victory_profile::zone!("host submit");
         #[cfg(feature = "diagnostics")]
         let mut called = std::time::Instant::now();
         // One submission at a time from preparation to copy-back: snapshots
@@ -4497,6 +4505,7 @@ impl Host {
         mut submitted: std::sync::MutexGuard<'a, u64>,
         #[cfg(feature = "diagnostics")] called: std::time::Instant,
     ) -> (std::sync::MutexGuard<'a, u64>, Option<Sent>) {
+        victory_profile::zone!("host submit part");
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         let was_working = working(true);
@@ -6992,6 +7001,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        victory_profile::zone!("host present");
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {

@@ -571,6 +571,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    victory_profile::zone!("texture upload");
     upload_from(list, resource, texture, 0);
 }
 
@@ -578,6 +579,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 /// placed texture the title may have no memory for the larger ones, and
 /// what lies there is another texture's.
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
+    victory_profile::zone!("texture upload from");
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -909,6 +911,7 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        victory_profile::zone!("detile texture");
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -954,6 +957,7 @@ pub(crate) fn unstage(resource: This) {
 /// through a table, and there may be none for one that shaders now pick by
 /// index alone.
 pub(crate) fn upload_again(resource: This) {
+    victory_profile::zone!("texture upload again");
     let staging = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref().and_then(|map| map.get(&(resource as usize)).cloned())

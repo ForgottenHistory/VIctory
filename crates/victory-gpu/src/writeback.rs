@@ -187,6 +187,7 @@ impl Owners {
     }
 
     pub(crate) fn publish(&self, shadow: u64, address: usize, data: &[u8]) -> usize {
+        victory_profile::zone!("writeback publish");
         self.publish_with(&CHANGED, shadow, address, data)
     }
 

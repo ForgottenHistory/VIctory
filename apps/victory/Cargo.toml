@@ -9,6 +9,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+victory-profile.workspace = true
 victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
@@ -23,6 +24,8 @@ walkdir.workspace = true
 tracing.workspace = true
 
 [features]
+# Timeline profiling with Tracy 0.14.1 (see crates/victory-profile).
+profile = ["victory-profile/profile"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

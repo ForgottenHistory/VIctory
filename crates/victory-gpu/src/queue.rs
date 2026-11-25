@@ -128,6 +128,7 @@ fn forces() -> bool {
 /// there, now and whenever a submission has run.
 #[cfg(windows)]
 fn submit_cut(this: This, lists: &[This]) {
+    victory_profile::zone!("submit cut at waits");
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -208,6 +209,7 @@ fn submit_cut(this: This, lists: &[This]) {
 /// after it; and lists named twice among those held stay in one piece.
 #[cfg(windows)]
 fn submit_split(this: This, lists: &[This]) {
+    victory_profile::zone!("submit split");
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -307,6 +309,7 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    victory_profile::zone!("release held submissions");
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
@@ -514,6 +517,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    victory_profile::zone!("title ExecuteCommandLists", format!("{count} lists"));
     if lists.is_null() {
         return;
     }
@@ -611,6 +615,7 @@ extern "system" fn signal2_x(
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
+    victory_profile::zone!("title queue Signal");
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -636,6 +641,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    victory_profile::zone!("title queue Wait");
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -760,6 +766,10 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::plot_frame();
+    victory_profile::frame();
+    victory_profile::zone!("title Present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -908,6 +918,7 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    victory_profile::zone!("title CopyPageMappings");
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

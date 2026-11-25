@@ -1316,3 +1316,33 @@ pub(crate) fn log(frames: f64) {
         );
     }
 }
+
+/// Timeline plots (the `profile` feature): each counter's growth since the
+/// last present, once per present, so single slow frames show where the
+/// line's averages hide them.
+pub(crate) fn plot_frame() {
+    if !victory_profile::ENABLED {
+        return;
+    }
+    static LAST: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+    let d = |c: C| {
+        let i = c as usize;
+        let now = COUNT[i].load(Relaxed);
+        now.saturating_sub(LAST[i].swap(now, Relaxed)) as f64
+    };
+    victory_profile::plot!("copy MB/frame", d(C::CopyBytes) / 1e6);
+    victory_profile::plot!("copied whole MB/frame", d(C::WholeBytes) / 1e6);
+    victory_profile::plot!("write-watch ms/frame", d(C::WatchUs) / 1e3);
+    victory_profile::plot!("guard faults/frame", d(C::GuardFaults));
+    victory_profile::plot!("list recording ms/frame", d(C::RecordNs) / 1e6);
+    victory_profile::plot!("pipeline wait ms/frame", d(C::PipelineWaitUs) / 1e3);
+    victory_profile::plot!("title frame-pace sleep ms/frame", d(C::PaceUs) / 1e3);
+    victory_profile::plot!("readback sync ms/frame", d(C::BackSyncUs) / 1e3);
+    let card = d(C::CardUnder2Us) + d(C::Card2To8Us) + d(C::Card8To32Us) + d(C::CardOver32Us);
+    victory_profile::plot!("card wait ms/frame", card / 1e3);
+    victory_profile::plot!("memory-value wait checks ms/frame", d(C::WaitCheckNs) / 1e6);
+    victory_profile::plot!("texture uploads/frame", d(C::TexUploads));
+    victory_profile::plot!("texture bytes hashed MB/frame", d(C::TexHashed) / 1e6);
+    victory_profile::plot!("submissions/frame", d(C::Submissions));
+    victory_profile::plot!("descriptor search ms/frame", d(C::DynamicNs) / 1e6);
+}

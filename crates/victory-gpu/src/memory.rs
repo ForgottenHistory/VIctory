@@ -523,6 +523,7 @@ pub(crate) fn ready(
     constants: &[u32],
     writes: Writes,
 ) -> Option<Ready> {
+    victory_profile::zone!("memory ready");
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();

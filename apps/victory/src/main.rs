@@ -134,6 +134,10 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    // Timeline profiling (the `profile` feature): a Tracy viewer on this
+    // machine can connect from here on.
+    victory_profile::start();
+    victory_profile::thread_name("main");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {

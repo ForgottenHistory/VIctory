@@ -294,6 +294,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+    victory_profile::zone!("card dirty pages");
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);

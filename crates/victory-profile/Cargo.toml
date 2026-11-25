@@ -1,0 +1,30 @@
+[package]
+name = "victory-profile"
+description = "Timeline profiling hooks (Tracy), compiled away unless the `profile` feature is on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Tracy 0.14.1 protocol: view captures with the matching tracy-profiler.
+# Default features are off: Tracy's crash handler would take the faults the
+# runtime handles itself, and broadcasting announces the process on the
+# network. Data is sent only to a viewer on this machine, once one connects.
+tracy-client = { version = "0.19.0", default-features = false, optional = true, features = [
+    "enable",
+    "manual-lifetime",
+    "ondemand",
+    "only-localhost",
+    "system-tracing",
+    "context-switch-tracing",
+    "sampling",
+    "code-transfer",
+] }
+
+[features]
+profile = ["dep:tracy-client"]
+
+[lints]
+workspace = true

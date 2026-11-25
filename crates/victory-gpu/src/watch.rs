@@ -76,6 +76,7 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    victory_profile::zone!("write-watch ask ahead");
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -173,6 +174,7 @@ pub(crate) fn once() -> bool {
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    victory_profile::zone!("write-watch ask once");
     if !once() {
         return;
     }
@@ -305,6 +307,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    victory_profile::zone!("write-watch query");
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));

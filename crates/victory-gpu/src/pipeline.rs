@@ -194,6 +194,7 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    victory_profile::zone!("translate shader");
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();

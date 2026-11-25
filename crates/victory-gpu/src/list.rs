@@ -623,6 +623,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    victory_profile::zone!("title list Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -630,6 +631,7 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    victory_profile::zone!("title list Reset");
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -1294,6 +1296,7 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    victory_profile::zone!("title list CopyMemory");
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
