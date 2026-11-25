@@ -27,6 +27,8 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+pub(crate) mod batch;
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -179,13 +181,18 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE)
+}
+
+/// A clamp pipeline compiled from `source` (this one's, or [`batch::SOURCE`]).
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -487,6 +494,63 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// The batched clamp's pipeline ([`batch`]).
+fn batch_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host().ok_or_else(windows::core::Error::empty).and_then(|h| make_from(&h.device, batch::SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no batched argument clamp: records are clamped one at a time");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
+/// the executions recorded after it, of `source` (a host copy's number and
+/// buffer) and of the `recent` ones after it. The table to add them to,
+/// and the buffer their clamped records go to. Replaces the list's compute
+/// root signature and pipeline (callers bind theirs after). `None` if the
+/// clamp is not available.
+pub(crate) fn open_batch(
+    list: &HostList,
+    source: (u64, &ID3D12Resource),
+    recent: &[(u64, ID3D12Resource)],
+) -> Option<(batch::Table, ID3D12Resource)> {
+    let c = batch_clamp()?;
+    let budget = list.budget()?;
+    let (jobs, at) = list.scratch(batch::TABLE)?;
+    let (dst, base, before) = list.batch_place()?;
+    let gpu = |b: &ID3D12Resource| {
+        // SAFETY: a live buffer.
+        Some(unsafe { b.GetGPUVirtualAddress() }).filter(|at| at.is_multiple_of(4))
+    };
+    // A source there is none of is the first again, which no job names.
+    let mut ids = [0u64; batch::SOURCES];
+    let mut sources = [gpu(source.1)?; batch::SOURCES];
+    ids[0] = source.0;
+    let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
+    for (i, (id, buffer)) in others.enumerate() {
+        if let Some(at) = gpu(buffer) {
+            // Bound, and read only if a job names it: kept alive like the
+            // copies draws read.
+            list.keep(buffer);
+            (ids[i + 1], sources[i + 1]) = (*id, at);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // SAFETY: the list's own upload memory of that many bytes, 256-byte
+    // aligned, until it is reset.
+    Some((unsafe { batch::Table::new(at, base, ids) }, dst))
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1192,6 +1256,63 @@ void main() {
     /// they are and are charged, the slots of all ones come out empty and
     /// charge nothing; clamped as single records the same slots are clamped
     /// to the most and spend the budget.
+    #[test]
+    fn warp_batch_clamps_the_records_its_table_names() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let batch = make_from(&warp.device, batch::SOURCE).expect("batched clamp must compile on WARP");
+        // Records 32 bytes apart: a mesh dispatch, a dispatch, a draw, and a
+        // mesh slot of all ones (garbage).
+        let mut src = vec![0u32; 32];
+        src[0..3].copy_from_slice(&[5, 1, 1]);
+        src[8..11].copy_from_slice(&[2, 3, 1]);
+        src[16..20].copy_from_slice(&[100, 2, 7, 9]);
+        src[24..27].copy_from_slice(&[u32::MAX, u32::MAX, u32::MAX]);
+        let (_src_buf, src_ptr, src_gpu) = warp.shared_buffer(128);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(1024);
+        let dst_buf = warp.default_uav(1024);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr().cast::<u8>(), src_ptr, 128);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        batch::record(&batch, &warp.list, (&dst_buf, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; batch::SOURCES], table_gpu);
+        // Jobs added after the pass is recorded, as the list goes on.
+        // SAFETY: the table's mapped bytes.
+        let mut table = unsafe { batch::Table::new(table_ptr, 64, [7, 0, 0, 0]) };
+        let mesh = table.place(7, 0, 10).unwrap();
+        let again = table.place(7, 0, 10).unwrap();
+        let dispatch = table.place(7, 32, 2).unwrap();
+        let draw = table.place(7, 64, 0).unwrap();
+        let garbage = table.place(7, 96, 10).unwrap();
+        assert_eq!(mesh, again, "the same record is clamped once");
+        assert!(table.place(8, 0, 10).is_none(), "a copy the pass does not read");
+        // SAFETY: an open list; the buffer goes back to common for the copy.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, 1024);
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mapped buffers.
+        let (out, spent) = unsafe {
+            (
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 256).to_vec(),
+                (budget_ptr as *const u32).read_volatile(),
+            )
+        };
+        let at = |place: u64, n: usize| out[place as usize / 4..place as usize / 4 + n].to_vec();
+        assert_eq!(at(mesh, 3), [5, 1, 1]);
+        assert_eq!(at(dispatch, 3), [2, 3, 1]);
+        assert_eq!(at(draw, 4), [100, 2, 7, 9]);
+        assert_eq!(at(garbage, 3), [65535, 1, 1], "clamped to the most one runs");
+        let expected = 2 * 5 * 128 + 6 * 64 + 200 + 65535 * 128;
+        assert_eq!(spent, expected, "each execution charged");
+    }
+
     #[test]
     fn warp_window_leaves_unfilled_slots_empty_and_uncharged() {
         let Some(mut warp) = WarpHarness::new() else {

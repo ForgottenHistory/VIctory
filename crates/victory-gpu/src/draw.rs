@@ -234,6 +234,57 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Whether the arguments of indirect executions of one record (no count
+/// buffer) are clamped in batches (`crate::indirect::batch`;
+/// `VICTORY_INDIRECT_BATCH=1` or `2`; off by default): one pass of ours
+/// clamps the records of every execution between two points where the
+/// arguments may change, at the first of them, instead of a pass between
+/// two waits before each execution. Arguments in buffers change by
+/// dispatches and by draws whose shaders store to buffers; those end the
+/// batch (`1`). `2`: a dispatch ends it only at the title's next wait (a
+/// barrier or a pipeline sync) or draw, since what a dispatch writes is not
+/// there for a later command without one. After avatarmanz/VIctory-7900XTX
+/// 0375962, where a replayed frame's 2,355 clamps became 133 passes (`2`).
+fn batches() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// An open batch of clamps ([`batches`]): its table, the buffer its
+/// records go to, the host list it is recorded in, and whether a dispatch
+/// was recorded since it opened (`2`).
+struct Batch {
+    table: crate::indirect::batch::Table,
+    scratch: ID3D12Resource,
+    list: usize,
+    wrote: bool,
+}
+
+/// Host copies indirect executions read their records from lately, newest
+/// first: a batch can read the records of these too.
+static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The others of [`ARGUMENT_COPIES`] after `first`, which becomes the newest.
+fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
+    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+    let live: Vec<_> = copies
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter(|s| s.id() != first.id())
+        .collect();
+    *copies = std::iter::once(first)
+        .chain(&live)
+        .take(crate::indirect::batch::SOURCES)
+        .map(std::sync::Arc::downgrade)
+        .collect();
+    live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -267,6 +318,8 @@ pub(crate) struct State {
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
+    /// The open batch of clamps, if any ([`batches`]).
+    batch: Option<Batch>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -2224,6 +2277,7 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: Option<u32>) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        self.buffers_written();
         let builder = crate::pipeline::is_builder(self.pipeline as This);
         #[cfg(feature = "diagnostics")]
         if builder {
@@ -2632,6 +2686,7 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3037,6 +3092,7 @@ impl State {
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3145,6 +3201,7 @@ impl State {
     ) {
         ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         self.window = None;
+        self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3187,6 +3244,66 @@ impl State {
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
+    /// Shaders that can write buffers were recorded: arguments may be others
+    /// from here on ([`batches`]).
+    fn buffers_written(&mut self) {
+        match &mut self.batch {
+            Some(batch) if batches() == 2 => batch.wrote = true,
+            batch => *batch = None,
+        }
+    }
+
+    /// A draw with the pipeline `p` was recorded: as
+    /// [`State::buffers_written`] if its shaders can store to buffers.
+    fn drew(&mut self, p: Option<&HostPipeline>) {
+        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            self.batch = None;
+        }
+    }
+
+    /// The title waits for earlier work (a barrier or a pipeline sync).
+    pub(crate) fn synced(&mut self) {
+        if self.batch.as_ref().is_some_and(|b| b.wrote) {
+            self.batch = None;
+        }
+    }
+
+    /// Where the clamped record of `kind` at `arguments` of the copy `args`
+    /// is once the batch's pass has run, from the open batch or a new one
+    /// ([`batches`]). `None` if it cannot be clamped in one.
+    fn batched(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        const BATCH_USE: usize = usize::MAX - 0x78;
+        const DISPATCH: u32 = 2;
+        let raw = list.list.as_raw() as usize;
+        // Another host list, or this one after its reset.
+        if list.first_use(BATCH_USE) || self.batch.as_ref().is_some_and(|b| b.list != raw) {
+            self.batch = None;
+        }
+        // A draw after dispatches waits for them.
+        if kind != DISPATCH {
+            self.synced();
+        }
+        let (id, offset) = (args.id(), args.offset(arguments));
+        if let Some(b) = &mut self.batch
+            && let Some(at) = b.table.place(id, offset, kind)
+        {
+            return Some((b.scratch.clone(), at));
+        }
+        self.batch = None;
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let at = table.place(id, offset, kind)?;
+        self.batch = Some(Batch { table, scratch: scratch.clone(), list: raw, wrote: false });
+        Some((scratch, at))
+    }
+
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
@@ -3363,6 +3480,17 @@ impl State {
         if !windowed || list.first_use(WINDOW_USE) {
             self.window = None;
         }
+        // One record, no count buffer, not in parts: clamped in a batch
+        // ([`batches`]) if it can be, else as before.
+        let batchable = batches() != 0 && parts.is_none() && max == 1 && count.is_none();
+        let batched = if batchable {
+            self.window = None;
+            args.refresh(list, arguments, len);
+            self.batched(list, &args, arguments, kind)
+        } else {
+            None
+        };
+        let from_batch = batched.is_some();
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
             .window
@@ -3370,7 +3498,7 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match hit {
+        let (bounded, at) = match batched.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -3438,7 +3566,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !from_batch {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -3487,7 +3617,15 @@ impl State {
             let name = crate::pipeline::shaders_of(self.pipeline as This);
             crate::capture::read_indirect(list, crate::capture::Records::Clamped(&bounded, at), count, (kind, stride, max), name);
         }
-        crate::indirect::done(list, &bounded);
+        // A batch's buffer stays readable until the list closes.
+        if !from_batch {
+            crate::indirect::done(list, &bounded);
+        }
+        if kind == DISPATCH {
+            self.buffers_written();
+        } else {
+            self.drew(Some(p));
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
