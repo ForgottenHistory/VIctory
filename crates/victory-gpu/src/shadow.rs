@@ -1790,6 +1790,11 @@ impl Shadow {
     }
 
     /// The copy's own number (see the field).
+    /// Whether it is no copy but title memory in place (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The title address the copy starts at.
     pub(crate) fn title_start(&self) -> u64 {
         self.start

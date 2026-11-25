@@ -2291,6 +2291,8 @@ struct Sent {
     texture_writes: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// What was taken off it to be done on the card ([`card_steps`]).
+    own: Option<card_steps::Taken>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2305,6 +2307,9 @@ struct Flight {
     card: Option<CardPlan>,
     back: Vec<Declared>,
     texture_writes: Vec<(usize, usize)>,
+    /// The list of ours that ran ahead of its lists ([`card_steps`]): back
+    /// to its pool when the flight is done with.
+    _own: Option<card_steps::Taken>,
 }
 
 /// Which submissions can publish a byte when several fences land together.
@@ -2350,6 +2355,8 @@ struct Line {
     /// submission lock ([`land`]: a settle may run under a caller's own
     /// locks).
     landed: Vec<(Vec<crate::list::Detached>, Vec<usize>)>,
+    /// With [`card_steps`]: what the flights being landed write.
+    landing: Vec<card_steps::Writer>,
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
@@ -2368,6 +2375,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    landing: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2455,7 +2463,7 @@ fn texture_dependency_cut(runs: &[&HostList]) -> Option<usize> {
     }
     let mut pending = PendingWrites::default();
     for (index, list) in runs.iter().enumerate() {
-        if !pending.is_empty() && blocked_by(&pending, std::slice::from_ref(list), false).is_some() {
+        if !pending.is_empty() && blocked_by(&pending, std::slice::from_ref(list), false, None).is_some() {
             return Some(index);
         }
         if index + 1 < runs.len() {
@@ -2484,7 +2492,7 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+fn late_blocked(runs: &[&HostList], skip: Option<&std::collections::HashSet<usize>>) -> Option<usize> {
     victory_profile::zone!("late blocked check");
     let written = {
         let line = line();
@@ -2493,7 +2501,7 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_by(&written, runs, true, skip)
 }
 
 /// Experiment (`VICTORY_IGNORE_FILL_READS=1`): a fill of upload memory that
@@ -2547,7 +2555,8 @@ fn note_fill_block(src: usize, len: usize, written: &PendingWrites) {
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Option<usize> {
+/// `skip`: fills (by their destination) done on the card ([`card_steps`]).
+fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Option<&std::collections::HashSet<usize>>) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -2577,7 +2586,7 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                     }
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    if let Some(f) = step.fills().iter().find(|f| {
+                    if let Some(f) = step.fills().iter().filter(|f| skip.is_none_or(|s| !s.contains(&f.dst))).find(|f| {
                         let (from, to) = (f.src, f.src.saturating_add(f.len));
                         written.touches(from, to) && {
                             // Where the card is seen never to write, no
@@ -2917,6 +2926,9 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                if card_steps::on() {
+                    line.landing = card_steps::writers(&items);
+                }
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -2928,7 +2940,12 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                host.relay_land(items, &mut fetch);
+                if card_steps::on() {
+                    line().landing.clear();
+                }
+            }
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
@@ -2988,6 +3005,8 @@ fn relay_hand_back(back: &[Declared], owners: &crate::writeback::Owners) {
     }
 }
 
+mod card_steps;
+
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
@@ -2995,6 +3014,7 @@ fn late_line(frames: f64) {
         return;
     }
     crate::unwritten::report(frames);
+    card_steps::log(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4475,6 +4495,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_writes: sent.texture_writes,
+                _own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4526,6 +4547,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_writes: sent.texture_writes,
+                _own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4729,17 +4751,30 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // Or the fills that wait are done on the card, behind the flights
+        // ([`card_steps`]).
+        let own = if late { self.card_steps(runs) } else { None };
+        let skip = own.as_ref().map(card_steps::Taken::fills);
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
+        } else if let Some(why) = late_blocked(runs, skip) {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
+                relay_wait(why, |line| blocked_by(&line.written, runs, false, skip).is_none());
             } else {
                 self.settle(&mut submitted, why);
             }
         }
+        // That list runs first, and is one of the submission's from here on.
+        let with: Vec<&HostList>;
+        let runs = match &own {
+            Some(own) => {
+                with = std::iter::once(own.list()).chain(runs.iter().copied()).collect();
+                &with[..]
+            }
+            None => runs,
+        };
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4812,7 +4847,7 @@ impl Host {
         let parallel = parallel_preludes(runs);
         let mut plans = Vec::new();
         for list in runs {
-            list.run_deferred(&mut batch);
+            list.run_deferred(&mut batch, skip);
             firsts.push(lists.len());
             if let Some(plan) = list.plan_prelude() {
                 lists.push(plan.commands.1.cast().ok());
@@ -4882,6 +4917,7 @@ impl Host {
                 back,
                 texture_writes,
                 writes,
+                own,
             };
             working(was_working);
             return (submitted, Some(sent));
@@ -5844,7 +5880,14 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let fill = Fill { dst: dst as usize, src: src as usize, len };
+        let fill = Fill { dst: dst as usize, src: src as usize, len, slot: None };
+        self.deferred().append_fill(fill, fill_workers());
+    }
+
+    /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
+    /// title heap's address, and the slot) shows.
+    pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        let fill = Fill { dst: dst as usize, src: src as usize, len, slot: Some(slot) };
         self.deferred().append_fill(fill, fill_workers());
     }
 
@@ -6139,7 +6182,9 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// Fills that `skip` names (by their destination) are left out: they
+    /// are done on the card ([`card_steps`]).
+    fn run_deferred(&self, batch: &mut Batch, skip: Option<&std::collections::HashSet<usize>>) {
         victory_profile::zone!("run deferred steps (refreshes, moves)");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -6159,7 +6204,14 @@ impl HostList {
                     len
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    let fills = step.fills();
+                    let kept: Vec<Fill>;
+                    let fills = match skip {
+                        Some(skip) if step.fills().iter().any(|f| skip.contains(&f.dst)) => {
+                            kept = step.fills().iter().filter(|f| !skip.contains(&f.dst)).copied().collect();
+                            &kept[..]
+                        }
+                        _ => step.fills(),
+                    };
                     let bytes = fills.iter().map(|f| f.len).sum::<usize>();
                     let jobs = run_fills(fills, fill_workers());
                     #[cfg(feature = "diagnostics")]
@@ -6247,6 +6299,10 @@ struct Fill {
     dst: usize,
     src: usize,
     len: usize,
+    /// If a descriptor slot shows that upload memory and nothing else does
+    /// (a constant buffer of a table made for the draw): the title heap and
+    /// the slot ([`card_steps`]).
+    slot: Option<(usize, u32)>,
 }
 
 impl Fill {
@@ -6349,6 +6405,7 @@ mod fill_tests {
                 dst: out.as_mut_ptr() as usize,
                 src: source[i * bytes..].as_ptr() as usize,
                 len: bytes,
+                slot: None,
             })
             .collect()
     }
@@ -6403,7 +6460,7 @@ mod fill_tests {
             buffers: vec![(last_byte, last_byte + 1)],
             textures: Vec::new(),
         };
-        assert_eq!(blocked_by(&pending, &[&list], false), Some(WHY_READ));
+        assert_eq!(blocked_by(&pending, &[&list], false, None), Some(WHY_READ));
         list.defer_copy(source.as_mut_ptr(), next.as_ptr(), 512);
         for fill in fills(&source, &mut after, 1) {
             list.deferred().append_fill(fill, 4);

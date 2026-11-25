@@ -2978,7 +2978,8 @@ impl State {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
+                        let slot = (std::ptr::from_ref(heap) as usize, index);
+                        list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
