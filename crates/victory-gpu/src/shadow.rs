@@ -1861,7 +1861,7 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, from: &'static str) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -1871,6 +1871,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        note_big_write(from, address, len, self.start, self.len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -3424,4 +3425,28 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Experiment logging: a declared shader write of 16 MB or more, by where it
+/// was declared, at most every 2 s per source.
+fn note_big_write(from: &'static str, address: u64, len: u64, start: u64, buffer: u64) {
+    if len < 16 << 20 {
+        return;
+    }
+    static LAST: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+    let now = crate::host::now_ms();
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match last.iter_mut().find(|e| e.0 == from) {
+            Some(e) if now < e.1 + 2000 => return,
+            Some(e) => e.1 = now,
+            None => last.push((from, now)),
+        }
+    }
+    tracing::info!(
+        from,
+        write = format_args!("{address:#x}+{len:#x}"),
+        buffer = format_args!("{start:#x}+{buffer:#x}"),
+        "a big declared shader write"
+    );
 }

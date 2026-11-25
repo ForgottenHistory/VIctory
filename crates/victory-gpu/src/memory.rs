@@ -569,12 +569,12 @@ pub(crate) fn ready(
     }
     for i in written {
         for &(start, len) in &m.ranges[i] {
-            m.copies[i].gpu_writes(list, start, len);
+            m.copies[i].gpu_writes(list, start, len, "raw memory range");
         }
     }
     writes.owned(&m.pages, |owner, at, len| {
         if owner < count as usize {
-            m.copies[owner].gpu_writes(list, at, len);
+            m.copies[owner].gpu_writes(list, at, len, "raw memory pages");
         }
     });
     #[cfg(feature = "diagnostics")]

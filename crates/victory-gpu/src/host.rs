@@ -2483,6 +2483,54 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Experiment (`VICTORY_IGNORE_FILL_READS=1`): a fill of upload memory that
+/// reads title memory flights may write no longer waits for them. Unsafe
+/// (the fill may take bytes from before the shaders' writes land); it
+/// measures what that wait costs.
+fn ignore_fill_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_IGNORE_FILL_READS").is_some_and(|v| v == "1" || v == "all");
+        if on {
+            tracing::warn!("fills of upload memory do not wait for flights that may write what they read (VICTORY_IGNORE_FILL_READS=1)");
+        }
+        on
+    })
+}
+
+/// Experiment (`VICTORY_IGNORE_FILL_READS=all`): as [`ignore_fill_reads`]
+/// for buffer copies and textures too. Measures what waiting for flights
+/// that may write what preparing reads costs in all.
+fn ignore_all_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IGNORE_FILL_READS").is_some_and(|v| v == "all"))
+}
+
+/// What a fill that has to wait collides with, at most every 2 s: the
+/// fill's source range, the declared write ranges it touches, and how much
+/// flights declare in all.
+fn note_fill_block(src: usize, len: usize, written: &PendingWrites) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 2000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let end = src.saturating_add(len);
+    let hit = |ranges: &[(usize, usize)]| -> Vec<String> {
+        ranges.iter().filter(|r| r.0 < end && r.1 > src).take(4).map(|r| format!("{:#x}+{:#x}", r.0, r.1 - r.0)).collect()
+    };
+    let total = |ranges: &[(usize, usize)]| ranges.iter().map(|r| r.1 - r.0).sum::<usize>();
+    tracing::info!(
+        fill = format_args!("{src:#x}+{len:#x}"),
+        buffers_hit = ?hit(&written.buffers),
+        textures_hit = ?hit(&written.textures),
+        declared_buffers = format_args!("{} ranges {} MB", written.buffers.len(), total(&written.buffers) >> 20),
+        declared_textures = format_args!("{} ranges {} MB", written.textures.len(), total(&written.textures) >> 20),
+        "a fill of upload memory waits for flights that may write what it reads"
+    );
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2498,15 +2546,21 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        if !ignore_all_reads() {
+                            return Some(WHY_READ);
+                        }
                     }
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    if step.fills().iter().any(|f| written.touches(f.src, f.src.saturating_add(f.len))) {
+                    if let Some(f) = step.fills().iter().find(|f| written.touches(f.src, f.src.saturating_add(f.len))) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            note_fill_block(f.src, f.len, written);
                         }
-                        return Some(WHY_READ);
+                        // Experiment: measure what this wait costs (stale reads possible).
+                        if !ignore_fill_reads() {
+                            return Some(WHY_READ);
+                        }
                     }
                 }
                 Step::Texture(staging) => {
@@ -2515,7 +2569,9 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool) -> Optio
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
-                        return Some(WHY_READ);
+                        if !ignore_all_reads() {
+                            return Some(WHY_READ);
+                        }
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
@@ -2754,6 +2810,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     }
     LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    victory_profile::zone!("wait for flights to land");
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
@@ -4012,6 +4069,7 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 drop(order);
                 self.card_sent();
+                victory_profile::zone!("fetch: wait for the card");
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
@@ -4032,6 +4090,7 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
+        victory_profile::zone!("merge fetched pieces into title memory");
         for (shadow, lo, hi, at) in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.

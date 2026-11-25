@@ -315,7 +315,10 @@ pub(crate) fn release_held(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
-    let _one = lock(&RELEASING);
+    let _one = {
+        victory_profile::zone!("release held: wait for the releasing lock");
+        lock(&RELEASING)
+    };
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
