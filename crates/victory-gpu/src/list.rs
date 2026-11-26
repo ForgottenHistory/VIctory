@@ -354,6 +354,11 @@ fn cut_at(this: This, wait: Option<ValueWait>) {
     }
     // What the title set so far, on the new host list.
     if let Some(host) = list.host.as_ref() {
+        // Diagnostics: its PIX region (from the fresh list's reset) says the kind.
+        if crate::host::pix_markers() {
+            crate::host::pix_end(&host.list);
+            crate::host::pix_begin(&host.list, &kind_region(list.kind, if wait.is_some() { "after a wait" } else { "after a placed copy" }));
+        }
         list.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -704,13 +709,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // of the title's list, to tell its compute lists' card time apart.
         if crate::host::pix_markers() {
             crate::host::pix_end(&host.list);
-            let name = match kind {
-                0 => "list: graphics",
-                2 => "list: compute",
-                3 => "list: copy",
-                _ => "list: other",
-            };
-            crate::host::pix_begin(&host.list, name);
+            crate::host::pix_begin(&host.list, &kind_region(kind, ""));
         }
         state.reset(pipeline);
     });
@@ -718,6 +717,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     #[cfg(not(windows))]
     let _ = this;
     S_OK
+}
+
+/// Diagnostics: the PIX region of a host list recording a title list of
+/// `kind`, and what it follows (a cut).
+#[cfg(windows)]
+fn kind_region(kind: u32, after: &str) -> String {
+    let kind = match kind {
+        0 => "graphics",
+        2 => "compute",
+        3 => "copy",
+        _ => "other",
+    };
+    if after.is_empty() { format!("list: {kind}") } else { format!("list: {kind}, {after}") }
 }
 
 /// A resource barrier as titles pass it: type, flags, then a resource and
