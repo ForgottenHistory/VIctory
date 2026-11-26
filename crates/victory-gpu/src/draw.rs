@@ -66,6 +66,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Diagnostics, while a stage's tables are walked: that stage's shader
+    /// (`*const Shader`, 0 outside), to name who declares a wide write
+    /// through a view in a table (`crate::host::wide_write_by`).
+    static TABLE_SHADER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1504,6 +1508,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            TABLE_SHADER.set(std::sync::Arc::as_ptr(&stage.shader) as usize);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
@@ -1515,6 +1520,7 @@ impl State {
                 compute,
             );
             STORES.set(true);
+            TABLE_SHADER.set(0);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -4230,7 +4236,15 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(address, len, 0);
+                match TABLE_SHADER.get() {
+                    0 => crate::host::wide_write(address, len, 0),
+                    shader => crate::host::wide_write_by(address, len, shader, || {
+                        // SAFETY: set from a live `Arc<Shader>` for the walk
+                        // of its stage's tables, which this is part of.
+                        let shader = unsafe { &*(shader as *const crate::pipeline::Shader) };
+                        format!("a view in a table of {}", shader.hash)
+                    }),
+                }
                 shadow.gpu_writes(list, address, len);
             } else {
                 #[cfg(feature = "diagnostics")]

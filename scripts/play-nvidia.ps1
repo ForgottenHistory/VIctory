@@ -22,6 +22,17 @@ param(
     [switch]$RayTracing,
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
+    # Local: no render-scale or upscaler patch at all (the title's own resolution, as our VIctory-dexnom builds run).
+    # Render scale 1.0 through the patch stops at a breakpoint at start.
+    [switch]$NativeScale,
+    # Local: VICTORY_CARD_STEPS after -Quality (0 off, 1 constant-buffer fills only, 2 also buffer copies).
+    # A text value, since -More's hashtable cannot be passed through powershell -File from a .bat.
+    [ValidateSet('0', '1', '2')][string]$CardSteps,
+    # Local: open PIX with these settings in its environment instead of starting the game (PIX launches it).
+    [switch]$Pix,
+    # Local: disarm the title's watchdog (VICTORY_NO_WATCHDOG; on with -Pix). It ends the process, by a write to address
+    # 0 at image+0x23cf683, when the main thread has not advanced for about 30 s: a capture or a long stall trips it.
+    [switch]$NoWatchdog,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -81,9 +92,16 @@ if ($Resolution) {
     $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
+if ($CardSteps) { $settings.VICTORY_CARD_STEPS = $CardSteps }
+if ($NoWatchdog -or $Pix) { $settings.VICTORY_NO_WATCHDOG = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
-$scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
-Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
+if ($NativeScale) {
+    $settings.Remove('VICTORY_RENDER_SCALE'); $settings.Remove('VICTORY_OWN_UPSCALER')
+    Write-Host "Series $console, the title's own resolution (no render-scale or upscaler patch)"
+} else {
+    $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
+    Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
+}
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
@@ -103,5 +121,18 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
+if ($Pix) {
+    $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $pixExe = Get-ChildItem 'C:\Program Files\Microsoft PIX\*\WinPix.exe' | Sort-Object FullName | Select-Object -Last 1
+    $shown = ($runArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    Write-Host "Fill these into PIX's 'Launch Win32' tab:"
+    Write-Host "  Path:              $((Resolve-Path $victory).Path)"
+    Write-Host "  Working directory: $root"
+    Write-Host "  Arguments:         $shown"
+    Write-Host "Tick 'For GPU capture', then Launch. In the game: load the save, stand still, press Print Screen once."
+    Write-Host "Save the capture in C:\Games\xbox\captures."
+    Start-Process $pixExe.FullName -WorkingDirectory $root
+    return
+}
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @runArgs } finally { Pop-Location }

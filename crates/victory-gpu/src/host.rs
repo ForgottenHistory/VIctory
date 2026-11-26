@@ -2855,6 +2855,22 @@ pub(crate) fn wide_write(address: u64, len: u64, pipeline: usize) {
     e.0 += 1;
 }
 
+/// Diagnostics: as [`wide_write`], for a view in a table whose declaring
+/// shader is known: `key` tells it apart (its address), `name` says it
+/// (asked once per range and key).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn wide_write_by(address: u64, len: u64, key: usize, name: impl FnOnce() -> String) {
+    if len < 1 << 20 {
+        return;
+    }
+    let mut all = WIDE_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all
+        .get_or_insert_with(Default::default)
+        .entry((address as usize, (address + len) as usize, key))
+        .or_insert_with(|| (0, name()));
+    e.0 += 1;
+}
+
 #[cfg(feature = "diagnostics")]
 fn blame(kind: &'static str, written: &[(usize, usize)], at: usize, len: usize) {
     let i = written.partition_point(|r| r.1 <= at);
