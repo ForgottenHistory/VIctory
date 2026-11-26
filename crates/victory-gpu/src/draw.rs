@@ -427,10 +427,14 @@ fn take_slots(
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let first = left.1;
         *left = (heap, first + n, left.2 - n);
+        #[cfg(feature = "diagnostics")]
+        crate::descriptor::host::asks::table(n, 0);
         return Some(first);
     }
     let taken = n.checked_next_multiple_of(crate::descriptor::host::DYNAMIC_GRAIN)?;
     let first = host.dynamic_or_wait(taken)?;
+    #[cfg(feature = "diagnostics")]
+    crate::descriptor::host::asks::table(n, taken);
     held.push((heap, first, taken));
     if left.0 != heap || taken - n > left.2 {
         *left = (heap, first + n, taken - n);
@@ -3292,6 +3296,8 @@ impl State {
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                #[cfg(feature = "diagnostics")]
+                crate::descriptor::host::asks::past();
             }
         }
         fresh.sort_unstable();

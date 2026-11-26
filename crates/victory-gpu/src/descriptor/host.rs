@@ -1459,6 +1459,54 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// and the search goes over a 128th of the flags.
 pub(crate) const DYNAMIC_GRAIN: u32 = 128;
 
+/// Diagnostics: what lists ask of the dynamic slots, told every five seconds:
+/// tables made afresh, the slots they are long, the slots taken for them in
+/// new blocks, the tables made afresh only for lying past the title's slots
+/// kept in place, and the fewest slots free in that time.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod asks {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static TABLES: AtomicU64 = AtomicU64::new(0);
+    static SLOTS: AtomicU64 = AtomicU64::new(0);
+    static TAKEN: AtomicU64 = AtomicU64::new(0);
+    static PAST: AtomicU64 = AtomicU64::new(0);
+    static LONG: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LEAST_FREE: AtomicU64 = AtomicU64::new(u64::MAX);
+    static TOLD: AtomicU64 = AtomicU64::new(0);
+
+    /// A table made afresh only because it reaches past the title's slots
+    /// kept in place.
+    pub(crate) fn past() {
+        PAST.fetch_add(1, Relaxed);
+    }
+
+    /// A table of `n` slots, for which `taken` slots were taken in new blocks
+    /// (0: it went into a block the list had).
+    pub(crate) fn table(n: u32, taken: u32) {
+        TABLES.fetch_add(1, Relaxed);
+        SLOTS.fetch_add(u64::from(n), Relaxed);
+        TAKEN.fetch_add(u64::from(taken), Relaxed);
+        if n > super::DYNAMIC_GRAIN {
+            LONG.fetch_add(1, Relaxed);
+        }
+        let now = crate::host::now_ms();
+        let told = TOLD.load(Relaxed);
+        if now >= told + 5000 && TOLD.compare_exchange(told, now, Relaxed, Relaxed).is_ok() {
+            tracing::info!(
+                "dynamic slots asked in the last {:.1} s: {} tables of {} slots in all ({} longer than a block), {} slots taken in blocks, {} tables only for lying past the title's slots in place; fewest slots free {}",
+                (now - told) as f64 / 1e3,
+                TABLES.swap(0, Relaxed),
+                SLOTS.swap(0, Relaxed),
+                LONG.swap(0, Relaxed),
+                TAKEN.swap(0, Relaxed),
+                PAST.swap(0, Relaxed),
+                LEAST_FREE.swap(u64::MAX, Relaxed)
+            );
+        }
+    }
+}
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1760,7 +1808,11 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(blocks * DYNAMIC_GRAIN, std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.fetch_sub(blocks * DYNAMIC_GRAIN, std::sync::atomic::Ordering::Relaxed) - blocks * DYNAMIC_GRAIN;
+        #[cfg(feature = "diagnostics")]
+        asks::LEAST_FREE.fetch_min(u64::from(free), std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = free;
         *next = ((first + n) % end.max(1)) as u32;
         Some(self.count + first as u32 * DYNAMIC_GRAIN)
     }
