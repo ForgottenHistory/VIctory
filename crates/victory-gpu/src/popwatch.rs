@@ -10,6 +10,9 @@
 //!   have moved them, while the neighbours' blocks there are found in each
 //!   other (a blip while the camera moves).
 //!
+//! LOCAL: `VICTORY_POP_WATCH=key`: frames are watched from one press of F10
+//! to the next (each press is logged), instead of in times given.
+//!
 //! `VICTORY_POP_FOLDER=<folder>`: the three pictures around a frame with
 //! blips (at most 200 times) are saved there, 640 wide; with
 //! `VICTORY_POP_ALL=1` every frame's is.
@@ -46,8 +49,39 @@ fn asked() -> &'static [(f64, f64)] {
     ASKED.get_or_init(|| std::env::var("VICTORY_POP_WATCH").map(|v| parse(&v)).unwrap_or_default())
 }
 
+/// LOCAL: whether F10 turns the watch on and off (`VICTORY_POP_WATCH=key`),
+/// and whether it is on now. Asked at each present.
+fn by_key() -> Option<bool> {
+    use std::sync::atomic::AtomicBool;
+    static KEYED: OnceLock<bool> = OnceLock::new();
+    static WAS_DOWN: AtomicBool = AtomicBool::new(false);
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+    if !*KEYED.get_or_init(|| std::env::var("VICTORY_POP_WATCH").is_ok_and(|v| v.trim() == "key")) {
+        return None;
+    }
+    // SAFETY: a plain query of the keyboard's state.
+    let state = unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F10,
+        ))
+    };
+    // Down now, or pressed since the last present (a frame takes 60 ms; a
+    // tap is shorter).
+    let down = state < 0 || state & 1 != 0;
+    if down && !WAS_DOWN.swap(true, Relaxed) {
+        let watching = !WATCHING.fetch_xor(true, Relaxed);
+        tracing::warn!(watching, at_s = crate::host::now_ms() as f64 / 1e3, "F10: pop watch");
+    } else if !down {
+        WAS_DOWN.store(false, Relaxed);
+    }
+    Some(WATCHING.load(Relaxed))
+}
+
 /// Whether frames are watched now.
 pub(crate) fn on() -> bool {
+    if let Some(watching) = by_key() {
+        return watching;
+    }
     let asked = asked();
     if asked.is_empty() {
         return false;
