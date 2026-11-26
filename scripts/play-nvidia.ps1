@@ -33,6 +33,9 @@ param(
     # Local: disarm the title's watchdog (VICTORY_NO_WATCHDOG; on with -Pix). It ends the process, by a write to address
     # 0 at image+0x23cf683, when the main thread has not advanced for about 30 s: a capture or a long stall trips it.
     [switch]$NoWatchdog,
+    # Local: other settings as NAME=VALUE, comma-separated (a .bat cannot pass -More's hashtable):
+    # -Set VICTORY_PLACED_ORDER=1,VICTORY_X=2
+    [string[]]$Set = @(),
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -94,6 +97,12 @@ if ($Resolution) {
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 if ($CardSteps) { $settings.VICTORY_CARD_STEPS = $CardSteps }
 if ($NoWatchdog -or $Pix) { $settings.VICTORY_NO_WATCHDOG = '1' }
+foreach ($pair in $Set) {
+    $name, $value = $pair -split '=', 2
+    if (-not $name -or $null -eq $value) { Write-Host "-Set wants NAME=VALUE, not '$pair'."; return }
+    $settings[$name.Trim()] = $value.Trim()
+    Write-Host "Set $($name.Trim())=$($value.Trim())"
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 if ($NativeScale) {
     $settings.Remove('VICTORY_RENDER_SCALE'); $settings.Remove('VICTORY_OWN_UPSCALER')
