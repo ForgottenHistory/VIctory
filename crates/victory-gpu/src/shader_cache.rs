@@ -90,6 +90,12 @@ fn build() -> [u8; 32] {
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // And every `VICTORY_*` switch the translator's sources name, with
+        // its value (`build.rs` finds them): the list above is kept by hand,
+        // and a switch missing from it is served another setting's
+        // translations. `VICTORY_NULL_SHADERS` was: a run after one with it
+        // drew with programs that return at once.
+        bytes.extend_from_slice(&victory_shader::emit::translation_fingerprint());
         bytes
     });
     let mut hash = blake3::Hasher::new();

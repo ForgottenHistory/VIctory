@@ -628,16 +628,50 @@ impl Player {
         let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
         let mut step = |what: &'static str, at: &mut Instant| {
             steps.push((what, at.elapsed()));
+            tracing::info!("replay: {what} made in {:.1} s", at.elapsed().as_secs_f64());
             *at = Instant::now();
         };
         let mut at = Instant::now();
         player.make_resources(options.buffers, &options.only_buffers)?;
         step("resources", &mut at);
+        {
+            let mut by: BTreeMap<String, (u32, u64)> = BTreeMap::new();
+            for h in &player.frame.heaps {
+                let e = by.entry(format!("{:?} flags {:#x}", h.props, h.flags)).or_default();
+                *e = (e.0 + 1, e.1 + h.size);
+            }
+            for (k, (n, size)) in by {
+                tracing::info!("replay: heaps {k}: {n}, {} MB", size >> 20);
+            }
+            let mut committed: BTreeMap<String, (u32, u64)> = BTreeMap::new();
+            for r in &player.frame.resources {
+                if let Place::Committed { props, .. } = &r.place {
+                    let e = committed.entry(format!("{props:?} dim {}", r.desc.dimension)).or_default();
+                    let size = if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                        r.desc.width
+                    } else {
+                        r.desc.width * u64::from(r.desc.height) * u64::from(r.desc.depth) * 4
+                    };
+                    *e = (e.0 + 1, e.1 + size);
+                }
+            }
+            for (k, (n, size)) in committed {
+                tracing::info!("replay: committed {k}: {n}, about {} MB", size >> 20);
+            }
+            tracing::info!("replay: memory [budget, used, PC's] MB: {:?}", player.memory());
+            // Diagnostics: stop before anything is sent to the card.
+            if std::env::var_os("VICTORY_REPLAY_STOP").is_some_and(|v| v == "resources") {
+                bail!("stopped after the resources (VICTORY_REPLAY_STOP)");
+            }
+        }
         player.make_pipelines(options.shaders.as_deref())?;
         step("pipelines", &mut at);
         player.make_descriptors()?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        if let Err(e) = player.load_contents() {
+            tracing::error!("replay: loading the contents failed: {}", player.removal());
+            return Err(e);
+        }
         step("contents", &mut at);
         player.make_masters(options.buffers, options.restore)?;
         step("copies to restore from", &mut at);
@@ -661,6 +695,100 @@ impl Player {
             steps.join(", ")
         ));
         Ok(player)
+    }
+
+    /// After the device was lost, with `--breadcrumbs`: where the card
+    /// faulted (and which of the frame's buffers holds the address), and
+    /// where each list stopped.
+    fn removal(&self) -> String {
+        let mut text = String::new();
+        if let Some(q) = &self.info {
+            for m in debug_messages(q) {
+                tracing::error!("replay: {m}");
+            }
+        }
+        // SAFETY: the outputs are the runtime's, valid while the device lives.
+        unsafe {
+            if let Err(e) = self.device.GetDeviceRemovedReason() {
+                let _ = write!(text, "reason {e}");
+            }
+            let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+                return text + "; no DRED (run with --breadcrumbs)";
+            };
+            if let Ok(fault) = dred.GetPageFaultAllocationOutput1()
+                && fault.PageFaultVA != 0
+            {
+                let va = fault.PageFaultVA;
+                let _ = write!(text, "; page fault at {va:#x}");
+                for (what, head) in [
+                    ("inside", fault.pHeadExistingAllocationNode),
+                    ("inside freed", fault.pHeadRecentFreedAllocationNode),
+                ] {
+                    let mut names = Vec::new();
+                    let mut node = head;
+                    while let Some(n) = node.as_ref()
+                        && names.len() < 8
+                    {
+                        let name = if n.ObjectNameW.is_null() {
+                            "unnamed".to_owned()
+                        } else {
+                            n.ObjectNameW.to_string().unwrap_or_default()
+                        };
+                        names.push(format!("{name} (type {})", n.AllocationType.0));
+                        node = n.pNext;
+                    }
+                    let _ = write!(text, "; {what} {names:?}");
+                }
+                let mut near: Vec<(u64, u32, u64)> = self
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.va != 0)
+                    .map(|(&id, o)| (o.va, id, self.frame.resources[o.index].desc.width))
+                    .collect();
+                near.sort();
+                let below = near.iter().rev().find(|n| n.0 <= va);
+                if let Some(&(at, id, width)) = below {
+                    let r = &self.frame.resources[self.objects[&id].index];
+                    let _ = write!(
+                        text,
+                        "; nearest buffer below: resource {id} at {at:#x}, {width} B ({}), {:?} {:?}",
+                        if va < at + width { "inside" } else { "past its end" },
+                        r.place,
+                        r.name
+                    );
+                }
+            }
+            match dred.GetAutoBreadcrumbsOutput() {
+                Ok(crumbs) => {
+                    let mut node = crumbs.pHeadAutoBreadcrumbNode;
+                    let mut lists = 0;
+                    while let Some(p) = node.as_ref() {
+                        lists += 1;
+                        let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                        if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
+                            let history = std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                            let around: Vec<i32> = history
+                                [done.saturating_sub(3) as usize..(done as usize + 3).min(history.len())]
+                                .iter()
+                                .map(|o| o.0)
+                                .collect();
+                            let _ = write!(
+                                text,
+                                "; a list stopped at command {done} of {} (op {}; ops around it {around:?})",
+                                p.BreadcrumbCount,
+                                history[done as usize].0
+                            );
+                        }
+                        node = p.pNext;
+                    }
+                    let _ = write!(text, "; {lists} lists in the breadcrumbs");
+                }
+                Err(e) => {
+                    let _ = write!(text, "; no breadcrumbs ({e})");
+                }
+            }
+        }
+        text
     }
 
     fn note(&mut self, n: String) {
@@ -747,8 +875,10 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, and
+        // not resident (the host makes such memory resident itself, the
+        // replay never does: the card faults at its first access).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -1468,9 +1598,23 @@ impl Player {
             .contents
             .iter()
             .filter(|c| self.objects.contains_key(&c.res))
+            .filter(|c| self.fits("content", c.res, c.first, c.len, true))
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
+        // Diagnostics: the first textures loaded, and where they lie.
+        for (c, _, _) in textures
+            .iter()
+            .filter(|(c, _, _)| self.frame.resources[self.objects[&c.res].index].desc.dimension != D3D12_RESOURCE_DIMENSION_BUFFER.0)
+            .take(4)
+        {
+            let r = &self.frame.resources[self.objects[&c.res].index];
+            let heap = match &r.place {
+                Place::Placed { heap, .. } => self.frame.heaps.iter().find(|h| h.id == *heap).map(|h| format!("{h:?}")),
+                _ => None,
+            };
+            tracing::info!("replay: texture content {c:?} into {r:?}, heap {heap:?}");
+        }
         self.worker.run(|list| {
             // SAFETY: an open list; live resources.
             unsafe {
@@ -1577,6 +1721,7 @@ impl Player {
         }
         let first: Vec<(Delta, u64, u64)> = first
             .into_iter()
+            .filter(|d| self.fits("first change", d.res, d.at, d.len, false))
             .map(|d| (d.clone(), d.len, d.file))
             .collect();
         self.upload(&first, &file, |player, list, parts, staging| {
@@ -1593,6 +1738,9 @@ impl Player {
         self.delta_parts = vec![Vec::new(); self.frame.submits.len()];
         for (i, all) in rest.into_iter().enumerate() {
             for d in all {
+                if !self.fits("later change", d.res, d.at, d.len, false) {
+                    continue;
+                }
                 later.push(((total, d.clone()), d.len, d.file));
                 total += d.len;
                 self.delta_parts[i].push((d, total - later.last().map_or(0, |l| l.1)));
@@ -1614,6 +1762,32 @@ impl Player {
             })?;
         }
         Ok(())
+    }
+
+    /// Whether `len` bytes at `at` of buffer `res` lie inside it (a texture's
+    /// parts, `content`, are not looked at); one that does not is left out
+    /// and told of (the first few of each kind), as a copy past a buffer's
+    /// end loses the device.
+    fn fits(&self, what: &str, res: u32, at: u64, len: u64, content: bool) -> bool {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static TOLD: AtomicU32 = AtomicU32::new(0);
+        let Some(o) = self.objects.get(&res) else {
+            return true;
+        };
+        let r = &self.frame.resources[o.index];
+        if r.desc.dimension != D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+            return true;
+        }
+        let _ = content;
+        let ok = at.checked_add(len).is_some_and(|end| end <= r.desc.width);
+        if !ok && TOLD.fetch_add(1, Relaxed) < 12 {
+            tracing::warn!(
+                "replay: a {what} past its buffer's end, left out: resource {res} ({} B, {:?}), {len} B at {at}",
+                r.desc.width,
+                r.place
+            );
+        }
+        ok
     }
 
     /// The buffers the frame names, in commands or descriptors: what the CPU
@@ -3064,10 +3238,17 @@ impl Player {
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
+        tracing::info!("replay: lists built; running the frame");
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
-            stamps.push(self.once(o, &mut made)?);
+            match self.once(o, &mut made) {
+                Ok(s) => stamps.push(s),
+                Err(e) => {
+                    tracing::error!("replay: the run failed: {}", self.removal());
+                    return Err(e);
+                }
+            }
         }
         self.finish(o, made, &stamps)
     }
