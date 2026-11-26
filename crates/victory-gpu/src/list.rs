@@ -307,6 +307,20 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// part has no wait after its first work).
 #[cfg(windows)]
 fn cut(this: This, wait: ValueWait) {
+    cut_at(this, Some(wait));
+}
+
+/// As [`cut`], without a wait: the recording goes on in a host list of its
+/// own, run right after the one so far in the same submission
+/// ([`detach_parts`] joins parts without waits into one entry). For a copy
+/// at its place in a list (`crate::host::cut_behind_placed`).
+#[cfg(windows)]
+fn cut_here(this: This) {
+    cut_at(this, None);
+}
+
+#[cfg(windows)]
+fn cut_at(this: This, wait: Option<ValueWait>) {
     if this.is_null() {
         return;
     }
@@ -317,24 +331,25 @@ fn cut(this: This, wait: ValueWait) {
         return;
     };
     if current.untouched() {
-        list.gate.push(wait);
+        list.gate.extend(wait);
         return;
     }
     let Some(fresh) = fresh_list() else {
         // shortcut: without a new host list the wait stands before the part
-        // it was recorded in.
+        // it was recorded in (and a cut without one is left out).
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!("no host list for the part after a wait: the wait moves to the part's start"));
-        list.gate.push(wait);
+        ONCE.call_once(|| tracing::warn!("no host list for the part after a cut: a wait moves to the part's start"));
+        list.gate.extend(wait);
         return;
     };
     current.close();
     static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-        tracing::info!(parts = list.earlier.len() + 2, "a list is cut at a wait for a memory value");
+        let at = if wait.is_some() { "a wait for a memory value" } else { "a copy at its place (VICTORY_PLACED_CUT)" };
+        tracing::info!(parts = list.earlier.len() + 2, "a list is cut at {at}");
     }
     if let Some(done) = list.host.replace(fresh) {
-        let waits = std::mem::replace(&mut list.gate, vec![wait]);
+        let waits = std::mem::replace(&mut list.gate, wait.into_iter().collect());
         list.earlier.push(Part { waits, host: done });
     }
     // What the title set so far, on the new host list.
@@ -850,6 +865,12 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     }
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
+        // What follows the copy records into a host list of its own, so a
+        // submission can be cut behind it (`VICTORY_PLACED_CUT`). Last: the
+        // cut moves the host list `list` points at.
+        if crate::host::cut_behind_placed() {
+            cut_here(this);
+        }
     } else {
         list.defer_copy(to, from, len);
     }

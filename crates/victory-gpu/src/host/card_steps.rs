@@ -103,6 +103,27 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+/// Whether the recording of a list is cut right behind each copy at its place
+/// (`VICTORY_PLACED_CUT=1`, with [`placed_order`], stage 2, the relay's second
+/// stage and lists cut at their waits; `crate::list::cut_here`), so that
+/// [`cut_for`] can cut a submission between the copy and a step behind it.
+///
+/// Why: with [`placed_order`] alone nothing changed (run 20261126-105458):
+/// every submission refused for [`BEHIND_PLACED`] had the step in the way in
+/// the copy's own list (0.69 a frame), where [`cut_for`] cannot cut, and stood
+/// some 45 ms of an 85 ms frame until the flights had landed. Some 25 copies a
+/// frame are placed, so as many more host lists.
+pub(crate) fn placed_cut() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PLACED_CUT") && stage() == 2 && relay_exact() && placed_order() && crate::queue::cuts();
+        if crate::switch::on("VICTORY_PLACED_CUT") {
+            tracing::info!(on, "lists cut behind each copy at its place (VICTORY_PLACED_CUT=1; needs VICTORY_PLACED_ORDER=1, VICTORY_CARD_STEPS=2, VICTORY_RELAY=2 and cut waits)");
+        }
+        on
+    })
+}
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 

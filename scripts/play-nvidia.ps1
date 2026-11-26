@@ -97,7 +97,7 @@ if ($Resolution) {
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 if ($CardSteps) { $settings.VICTORY_CARD_STEPS = $CardSteps }
 if ($NoWatchdog -or $Pix) { $settings.VICTORY_NO_WATCHDOG = '1' }
-foreach ($pair in $Set) {
+foreach ($pair in ($Set | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
     $name, $value = $pair -split '=', 2
     if (-not $name -or $null -eq $value) { Write-Host "-Set wants NAME=VALUE, not '$pair'."; return }
     $settings[$name.Trim()] = $value.Trim()
