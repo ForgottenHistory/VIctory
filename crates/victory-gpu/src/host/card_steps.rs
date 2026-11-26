@@ -461,26 +461,57 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
 /// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
 /// its own, behind that copy.
 pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
-    if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
+    if stage() == 0 || !relay_exact() || !placed_order() {
         return None;
     }
     // (Most submissions have none.)
-    let first = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
-    if first + 1 == runs.len() {
+    let Some(first) = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_)))) else {
         return None;
+    };
+    // Diagnostics from here on: why a submission with a placed copy is not cut.
+    let why = |why: &'static str| {
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut all = CUT_WHY.lock().unwrap_or_else(|e| e.into_inner());
+            *all.get_or_insert_with(Default::default).entry(why).or_default() += 1;
+        }
+        let _ = why;
+        None
+    };
+    if runs.len() < 2 {
+        return why("one list in the submission");
+    }
+    if first + 1 == runs.len() {
+        return why("the first placed copy is in the last list");
     }
     let written = line().written.clone();
-    blocked_by(&written, runs, false)?;
+    if blocked_by(&written, runs, false).is_none() {
+        return why("not blocked by flights");
+    }
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
-        return None;
+        return why("the plan does not refuse for a placed copy");
     }
-    let (placed, reader) = behind?;
+    let Some((placed, reader)) = behind else {
+        return why("refused for a placed copy, no step behind it found");
+    };
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
-    let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let (Some(p), Some(r)) = (place(placed), place(reader)) else {
+        return why("the placed copy's or the reader's list not found");
+    };
+    let cut = p + 1;
+    if r < cut {
+        return why("the reader is in the placed copy's own list");
+    }
+    why("cut");
+    Some(cut)
 }
+
+/// Diagnostics: why [`cut_for`] did or did not cut a submission with a copy
+/// at its place in a list, since the last frame-rate line.
+#[cfg(feature = "diagnostics")]
+static CUT_WHY: Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> = Mutex::new(None);
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
 /// asking Windows walks the page tables, milliseconds in the title's heap).
@@ -907,6 +938,11 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    #[cfg(feature = "diagnostics")]
+    if let Some(cuts) = CUT_WHY.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let text: Vec<String> = cuts.iter().map(|(why, n)| format!("{why} {:.2}", *n as f64 / frames)).collect();
+        tracing::info!("submissions with a copy at its place in a list, per frame (VICTORY_PLACED_ORDER): {}", text.join(", "));
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
