@@ -455,6 +455,29 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // LOCAL, diagnostics: `VICTORY_WAVE_LOCAL_FIRST` (off by default), for a
+    // console wave64 compute program on a host of 32-lane waves: each host
+    // wave as a wave of its own (`lower::with_local_waves`: no exchange
+    // between the halves, so no group barriers) before the forms that
+    // exchange. `idiom`: only where that is exact (`lower::wave_local`);
+    // `any`: every such program, every mask and lane read per host wave
+    // (approximate: what removing the exchange could gain at most).
+    if native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+        let mode = std::env::var("VICTORY_WAVE_LOCAL_FIRST").unwrap_or_default();
+        let local = match mode.as_str() {
+            "idiom" if lower::wave_local(p, st).is_ok() => {
+                Some(lower::with_local_waves(|| emit_program(c, native, p, st, io, res)))
+            }
+            "any" => Some(lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))),
+            _ => None,
+        };
+        lower::take_needs();
+        if let Some(Ok((shader, wave))) = local
+            && wave != Some(64)
+        {
+            return Ok(shader);
+        }
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every

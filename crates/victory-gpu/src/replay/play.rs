@@ -910,12 +910,18 @@ impl Player {
         }
         let mut failed = 0;
         let mut moves: BTreeMap<String, (u32, u64)> = BTreeMap::new();
+        // The moved buffers by name (numbers in names left out).
+        let mut named: BTreeMap<String, (u32, u64)> = BTreeMap::new();
         for (index, r) in self.frame.resources.iter().enumerate() {
             let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
             let moved = is_buffer && chosen(r, only);
             if moved && let Place::Committed { props, .. } = &r.place {
                 let seen = gpu::seen(props);
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
+                *m = (m.0 + 1, m.1 + r.desc.width);
+                let plain: String = r.name.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+                let plain = plain.split('#').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("#");
+                let m = named.entry(format!("{seen:?} \"{plain}\"")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
             let mut desc = gpu::to_desc(&r.desc);
@@ -1011,6 +1017,11 @@ impl Player {
             self.notes.push(format!(
                 "--buffers is of, by how the CPU saw them (buffers, bytes): {moves:?}"
             ));
+            let mut by_bytes: Vec<_> = named.into_iter().collect();
+            by_bytes.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+            for (name, (n, bytes)) in by_bytes.into_iter().take(30) {
+                self.notes.push(format!("--buffers moved: {n} of {name}, {} KB", bytes >> 10));
+            }
         }
         Ok(())
     }
