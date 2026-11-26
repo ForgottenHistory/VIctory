@@ -1778,8 +1778,9 @@ enum Step {
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
-    /// Work that writes host memory only.
-    Host(Box<dyn Fn() + Send>),
+    /// Work that writes host memory only, and the title memory it reads
+    /// (from, to; empty for none).
+    Host(Box<dyn Fn() + Send>, (usize, usize)),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -2309,7 +2310,7 @@ struct Flight {
     texture_writes: Vec<(usize, usize)>,
     /// The list of ours that ran ahead of its lists ([`card_steps`]): back
     /// to its pool when the flight is done with.
-    _own: Option<card_steps::Taken>,
+    own: Option<card_steps::Taken>,
 }
 
 /// Which submissions can publish a byte when several fences land together.
@@ -2492,16 +2493,16 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList], skip: Option<&std::collections::HashSet<usize>>) -> Option<usize> {
+fn late_blocked(runs: &[&HostList], skip: Option<&card_steps::Skips>) -> Option<usize> {
     victory_profile::zone!("late blocked check");
-    let written = {
+    let (written, copies) = {
         let line = line();
         if line.written.is_empty() {
             return None;
         }
-        line.written.clone()
+        (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true, skip)
+    blocked_by(&written, runs, true, skip).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
 }
 
 /// Experiment (`VICTORY_IGNORE_FILL_READS=1`): a fill of upload memory that
@@ -2555,8 +2556,8 @@ fn note_fill_block(src: usize, len: usize, written: &PendingWrites) {
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-/// `skip`: fills (by their destination) done on the card ([`card_steps`]).
-fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Option<&std::collections::HashSet<usize>>) -> Option<usize> {
+/// `skip`: the steps done on the card ([`card_steps`]).
+fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Option<&card_steps::Skips>) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -2564,6 +2565,9 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    if skip.is_some_and(|s| s.copy((dst, src, len))) {
+                        continue;
+                    }
                     let src_hit = written.touches(src, src + len);
                     let dst_hit = written.touches(dst, dst + len);
                     if src_hit || dst_hit {
@@ -2586,7 +2590,7 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Op
                     }
                 }
                 Step::Fill(_) | Step::Fills(_) => {
-                    if let Some(f) = step.fills().iter().filter(|f| skip.is_none_or(|s| !s.contains(&f.dst))).find(|f| {
+                    if let Some(f) = step.fills().iter().filter(|f| skip.is_none_or(|s| !s.fill(f.dst))).find(|f| {
                         let (from, to) = (f.src, f.src.saturating_add(f.len));
                         written.touches(from, to) && {
                             // Where the card is seen never to write, no
@@ -2631,7 +2635,7 @@ fn blocked_by(written: &PendingWrites, runs: &[&HostList], count: bool, skip: Op
                         return Some(WHY_READ);
                     }
                 }
-                Step::Host(_) => {}
+                Step::Host(..) => {}
             }
         }
     }
@@ -4495,7 +4499,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_writes: sent.texture_writes,
-                _own: sent.own,
+                own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4547,7 +4551,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 texture_writes: sent.texture_writes,
-                _own: sent.own,
+                own: sent.own,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -4754,14 +4758,16 @@ impl Host {
         // Or the fills that wait are done on the card, behind the flights
         // ([`card_steps`]).
         let own = if late { self.card_steps(runs) } else { None };
-        let skip = own.as_ref().map(card_steps::Taken::fills);
+        let skip = own.as_ref().map(card_steps::Taken::skips);
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs, skip) {
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false, skip).is_none());
+                relay_wait(why, |line| {
+                    blocked_by(&line.written, runs, false, skip).is_none() && !card_steps::copied_read(&card_steps::copies(line), runs)
+                });
             } else {
                 self.settle(&mut submitted, why);
             }
@@ -6021,7 +6027,7 @@ impl HostList {
                 for k in 0..3 {
                     words.add(k).write_volatile(0);
                 }
-            })));
+            }), (0, 0)));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -6170,7 +6176,13 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work)));
+        self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
+    }
+
+    /// As [`HostList::defer_host`], for work that reads `len` bytes of title
+    /// memory at `from`.
+    pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -6184,13 +6196,14 @@ impl HostList {
     /// lists of a submission, through many ranges).
     /// Fills that `skip` names (by their destination) are left out: they
     /// are done on the card ([`card_steps`]).
-    fn run_deferred(&self, batch: &mut Batch, skip: Option<&std::collections::HashSet<usize>>) {
+    fn run_deferred(&self, batch: &mut Batch, skip: Option<&card_steps::Skips>) {
         victory_profile::zone!("run deferred steps (refreshes, moves)");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
             let copied = match step {
+                &Step::Copy(dst, src, len) if skip.is_some_and(|s| s.copy((dst, src, len))) => continue,
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -6206,8 +6219,8 @@ impl HostList {
                 Step::Fill(_) | Step::Fills(_) => {
                     let kept: Vec<Fill>;
                     let fills = match skip {
-                        Some(skip) if step.fills().iter().any(|f| skip.contains(&f.dst)) => {
-                            kept = step.fills().iter().filter(|f| !skip.contains(&f.dst)).copied().collect();
+                        Some(skip) if step.fills().iter().any(|f| skip.fill(f.dst)) => {
+                            kept = step.fills().iter().filter(|f| !skip.fill(f.dst)).copied().collect();
                             &kept[..]
                         }
                         _ => step.fills(),
@@ -6235,7 +6248,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work) => {
+                Step::Run(work) | Step::Host(work, _) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
