@@ -2187,6 +2187,12 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 static BARRIER_KINDS: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), u64>>> = std::sync::Mutex::new(None);
 #[cfg(all(windows, feature = "diagnostics"))]
 static BARRIER_CALLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Diagnostics: the calls by what their barriers need of the one global wait
+/// recorded for each: nothing (every barrier's sync before or after is none),
+/// only earlier reads finished (no barrier has a write before it), or earlier
+/// writes finished.
+#[cfg(all(windows, feature = "diagnostics"))]
+static BARRIER_NEEDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// # Safety
 /// `groups` holds `count` `D3D12_BARRIER_GROUP`s whose barrier arrays are live.
@@ -2236,6 +2242,20 @@ pub(crate) unsafe fn note_barrier_kinds(count: u32, groups: *const u8) {
     }
     BARRIER_CALLS[0].fetch_add(1, Relaxed);
     BARRIER_CALLS[1].fetch_add(kinds.len() as u64, Relaxed);
+    // Writes: unordered access, render target, depth write, copy destination,
+    // resolve destination, stream output.
+    const WRITES: u32 = 0x10 | 0x8 | 0x20 | 0x400 | 0x1000 | 0x100;
+    const NO_ACCESS: u32 = 0x8000_0000;
+    let waits = |k: &(u32, u32, u32, u32, u32, u32, u32)| k.1 != 0 && k.2 != 0;
+    let wrote = |k: &(u32, u32, u32, u32, u32, u32, u32)| k.3 & NO_ACCESS == 0 && k.3 & WRITES != 0;
+    let need = if !kinds.iter().any(waits) {
+        0
+    } else if !kinds.iter().filter(|k| waits(k)).any(wrote) {
+        1
+    } else {
+        2
+    };
+    BARRIER_NEEDS[need].fetch_add(1, Relaxed);
     if kinds.is_empty() {
         BARRIER_CALLS[2].fetch_add(1, Relaxed);
     }
@@ -2252,6 +2272,10 @@ pub(crate) unsafe fn note_barrier_kinds(count: u32, groups: *const u8) {
 pub(crate) fn log_barrier_kinds(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let [calls, barriers, empty] = [0, 1, 2].map(|i| BARRIER_CALLS[i].swap(0, Relaxed) as f64 / frames);
+    let [none, reads, writes] = [0, 1, 2].map(|i| BARRIER_NEEDS[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "  the title's barrier calls by what they need of their global wait, per frame: {none:.0} nothing (every barrier's          sync before or after is none), {reads:.0} only earlier reads done, {writes:.0} earlier writes done"
+    );
     let Some(all) = BARRIER_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
