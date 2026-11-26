@@ -694,9 +694,24 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.earlier.clear();
         list.gate.clear();
     }
+    // SAFETY: the title passes one of our lists.
+    #[cfg(windows)]
+    let kind = unsafe { (*this.cast::<List>()).kind };
     #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
+        // Diagnostics: the PIX region the reset opened ("list") says the kind
+        // of the title's list, to tell its compute lists' card time apart.
+        if crate::host::pix_markers() {
+            crate::host::pix_end(&host.list);
+            let name = match kind {
+                0 => "list: graphics",
+                2 => "list: compute",
+                3 => "list: copy",
+                _ => "list: other",
+            };
+            crate::host::pix_begin(&host.list, name);
+        }
         state.reset(pipeline);
     });
     crate::pipeline::bound(pipeline);
