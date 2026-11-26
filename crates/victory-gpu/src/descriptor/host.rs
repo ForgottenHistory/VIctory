@@ -1749,6 +1749,78 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// [`HostHeap::dynamic`], waiting for slots to be given back if there are
+    /// none: lists give theirs back when their submission has run
+    /// ([`HostHeap::release`]), within milliseconds while flights land, and a
+    /// table refused is a draw dropped (things missing for as long as a frame
+    /// asks for more tables than the slots hold with the frame before still
+    /// in the air: 400-580 draws a frame, runs of 2026-11-26). Waits at most
+    /// `VICTORY_DYNAMIC_WAIT_MS` (100; 0: not at all, as before) for one ask;
+    /// after a wait that ended without slots none is waited for during the
+    /// next second (slots too few for a frame alone must not stop every
+    /// table for the whole wait).
+    pub(crate) fn dynamic_or_wait(&self, n: u32) -> Option<u32> {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        use std::time::{Duration, Instant};
+        static MOST_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        /// Waits, those that ended without slots, microseconds waited; when
+        /// they were last told of and when waiting was last given up
+        /// (milliseconds since the first ask, plus one).
+        static WAITS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+        static TOLD: AtomicU64 = AtomicU64::new(0);
+        static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        if let Some(first) = self.dynamic(n) {
+            return Some(first);
+        }
+        let most = *MOST_MS.get_or_init(|| {
+            std::env::var("VICTORY_DYNAMIC_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)
+        });
+        if most == 0 || self.sampler || n == 0 || n > self.dynamic {
+            return None;
+        }
+        let now_ms = || START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1;
+        let gave_up = GAVE_UP.load(Relaxed);
+        if gave_up != 0 && now_ms() < gave_up + 1000 {
+            return None;
+        }
+        let began = Instant::now();
+        let deadline = began + Duration::from_millis(most);
+        let found = loop {
+            // (A release sets `too_long` anew: something was given back.)
+            while self.too_long.load(Relaxed) != u32::MAX && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            if let Some(first) = self.dynamic(n) {
+                break Some(first);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        };
+        WAITS[0].fetch_add(1, Relaxed);
+        WAITS[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        if found.is_none() {
+            WAITS[1].fetch_add(1, Relaxed);
+            GAVE_UP.store(now_ms(), Relaxed);
+        }
+        let now = now_ms();
+        let told = TOLD.load(Relaxed);
+        if now >= told + 5000 && TOLD.compare_exchange(told, now, Relaxed, Relaxed).is_ok() {
+            tracing::warn!(
+                waits = WAITS[0].load(Relaxed),
+                without_slots = WAITS[1].load(Relaxed),
+                waited_ms = WAITS[2].load(Relaxed) / 1000,
+                free = self.free.load(Relaxed),
+                of = self.dynamic,
+                asked = n,
+                "dynamic descriptor slots ran out: tables waited for slots given back (VICTORY_DYNAMIC_WAIT_MS; since the start)"
+            );
+        }
+        found
+    }
+
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
@@ -5799,6 +5871,32 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn a_table_waits_for_slots_given_back() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let all = heap.dynamic(heap.dynamic).unwrap();
+        assert_eq!(heap.dynamic(8), None);
+        // Given back while the ask waits: it gets them.
+        let got = std::thread::scope(|s| {
+            let waiter = s.spawn(|| (heap.dynamic_or_wait(8), std::time::Instant::now()));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let released = std::time::Instant::now();
+            heap.release(all, 8);
+            let (got, at) = waiter.join().unwrap();
+            assert!(at >= released, "the ask came back before anything was given back");
+            got
+        });
+        assert_eq!(got, Some(all));
+        // Nothing given back: the ask ends without slots, and the next one
+        // does not wait.
+        assert_eq!(heap.dynamic_or_wait(8), None);
+        let began = std::time::Instant::now();
+        assert_eq!(heap.dynamic_or_wait(8), None);
+        assert!(began.elapsed() < std::time::Duration::from_millis(50));
     }
 
     #[test]
