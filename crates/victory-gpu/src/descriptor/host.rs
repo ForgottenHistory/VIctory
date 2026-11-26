@@ -156,7 +156,7 @@ pub(crate) struct HostHeap {
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
+    /// (by lists not yet reset): both in blocks of [`DYNAMIC_GRAIN`] slots.
     next: Mutex<(u32, Vec<bool>)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
@@ -1283,7 +1283,8 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let block = ((index - host.count) / DYNAMIC_GRAIN) as usize;
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get(block).copied();
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1446,6 +1447,18 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// Dynamic slots are given out in blocks of this many, each ask rounded up to
+/// whole blocks, and a list packs its tables into the blocks it took
+/// (`take_slots` in `crate::draw`); a list gives all its blocks back at once.
+/// Given out slot by slot, at any length, the free slots lay in pieces once
+/// a frame asked for 24,000 tables (9 slots each on average, up to 258): a
+/// table of 102 to 191 slots found no run with 67,000 to 118,000 of the
+/// 499,999 free, 1,700-1,900 tables a frame were refused (each a draw
+/// dropped), and the search for a run took 400-680 ms a frame (runs 20:05,
+/// 20:10 and 20:26 of 2026-11-26). With blocks a free block is always whole,
+/// and the search goes over a 128th of the flags.
+pub(crate) const DYNAMIC_GRAIN: u32 = 128;
+
 /// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
 /// (0: none): up to four times as many where the host heap has the room (a
 /// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
@@ -1586,8 +1599,8 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
-            free: std::sync::atomic::AtomicU32::new(extra),
+            next: Mutex::new((0, vec![false; (extra / DYNAMIC_GRAIN) as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra / DYNAMIC_GRAIN * DYNAMIC_GRAIN),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Slots::new(count as usize),
@@ -1692,7 +1705,8 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
-    /// [`HostHeap::release`]: the first's index.
+    /// [`HostHeap::release`]: the first's index. Whole blocks of
+    /// [`DYNAMIC_GRAIN`] slots are taken (`n` rounded up).
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
@@ -1703,13 +1717,15 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
-        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
+        // In blocks from here on.
+        let blocks = n.div_ceil(DYNAMIC_GRAIN);
+        let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= blocks * DYNAMIC_GRAIN
+            && blocks < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+        let n = blocks as usize;
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
-        let end = self.dynamic as usize;
+        let end = taken.len();
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
         let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
@@ -1729,10 +1745,10 @@ impl HostHeap {
         }
         let Some(first) = found else {
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.fetch_min(blocks, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| tracing::warn!(blocks, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1744,9 +1760,9 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
-        Some(self.count + first as u32)
+        self.free.fetch_sub(blocks * DYNAMIC_GRAIN, std::sync::atomic::Ordering::Relaxed);
+        *next = ((first + n) % end.max(1)) as u32;
+        Some(self.count + first as u32 * DYNAMIC_GRAIN)
     }
 
     /// [`HostHeap::dynamic`], waiting for slots to be given back if there are
@@ -2656,13 +2672,16 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
+        // The blocks the slots lie in: what `dynamic` took for an ask of
+        // `n` at `first`.
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+        let from = (at / DYNAMIC_GRAIN) as usize;
+        let to = ((at + n).div_ceil(DYNAMIC_GRAIN) as usize).min(guard.1.len());
+        if let Some(blocks) = guard.1.get_mut(from..to) {
+            let given = blocks.iter().filter(|taken| **taken).count() as u32;
+            self.free.fetch_add(given * DYNAMIC_GRAIN, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+            blocks.fill(false);
         }
     }
 
@@ -5863,14 +5882,18 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(heap.dynamic - 100).unwrap();
+        const G: u32 = DYNAMIC_GRAIN;
+        let blocks = heap.dynamic / G;
+        // All but two blocks, then one: whole blocks, whatever is asked.
+        let a = heap.dynamic((blocks - 2) * G - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
-        // 40 left at the end: 50 do not fit until something is given back.
-        assert_eq!(heap.dynamic(50), None);
-        heap.release(a, 50);
-        assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+        assert_eq!((a, b), (4, 4 + (blocks - 2) * G));
+        // One block left: two do not fit until something is given back.
+        assert_eq!(heap.dynamic(G + 1), None);
+        heap.release(a, G + 1);
+        assert_eq!(heap.dynamic(G + 1), Some(4));
+        assert_eq!(heap.dynamic(40), Some(4 + (blocks - 1) * G));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     #[test]
@@ -5878,7 +5901,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let all = heap.dynamic(heap.dynamic).unwrap();
+        let all = heap.dynamic(heap.dynamic / DYNAMIC_GRAIN * DYNAMIC_GRAIN).unwrap();
         assert_eq!(heap.dynamic(8), None);
         // Given back while the ask waits: it gets them.
         let got = std::thread::scope(|s| {
@@ -5905,25 +5928,27 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             eprintln!("no host descriptor heap; skipped");
             return;
         };
+        const G: u32 = DYNAMIC_GRAIN;
+        let blocks = heap.dynamic / G;
         let first = heap.dynamic(1).unwrap();
-        let left = heap.dynamic(2).unwrap();
-        let right = heap.dynamic(2).unwrap();
-        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
-        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
+        let left = heap.dynamic(2 * G).unwrap();
+        let right = heap.dynamic(2 * G).unwrap();
+        let rest = heap.dynamic((blocks - 5) * G).unwrap();
+        assert_eq!((first, left, right, rest), (4, 4 + G, 4 + 3 * G, 4 + 5 * G));
 
         // Reallocating the left half puts the cursor back in the middle.
-        heap.release(left, 2);
-        assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
-        assert_eq!(heap.dynamic(4), Some(left));
+        heap.release(left, 2 * G);
+        assert_eq!(heap.dynamic(2 * G), Some(left));
+        heap.release(left, 2 * G);
+        heap.release(right, 2 * G);
+        assert_eq!(heap.dynamic(4 * G), Some(left));
         assert_eq!(heap.dynamic(1), None);
 
-        // A free slot at each physical end does not form a two-slot range.
+        // A free block at each physical end does not form a two-block range.
         heap.release(first, 1);
-        let last = first + heap.dynamic - 1;
+        let last = first + (blocks - 1) * G;
         heap.release(last, 1);
-        assert_eq!(heap.dynamic(2), None);
+        assert_eq!(heap.dynamic(G + 1), None);
     }
 }
 

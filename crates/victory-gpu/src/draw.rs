@@ -346,8 +346,12 @@ pub(crate) struct State {
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list has run, is reset or released.
+    /// back when the list has run, is reset or released. Whole blocks
+    /// (`crate::descriptor::host::DYNAMIC_GRAIN`), which [`take_slots`]
+    /// packs the list's tables into.
     dynamic: Vec<(usize, u32, u32)>,
+    /// What is left of the blocks taken last: title heap, next slot, slots.
+    dynamic_left: (usize, u32, u32),
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -371,6 +375,13 @@ impl Drop for State {
 }
 
 impl State {
+    /// Tests: the slot the list's next table would begin at, in the block
+    /// it took last.
+    #[cfg(test)]
+    pub(crate) fn next_dynamic_slot(&self) -> u32 {
+        self.dynamic_left.1
+    }
+
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
     /// until the title resets the list. A frame of the opening cutscene
@@ -389,12 +400,42 @@ impl State {
         for (heap, first, n) in self.dynamic.drain(..) {
             crate::descriptor::release_dynamic(heap, first, n);
         }
+        self.dynamic_left = (0, 0, 0);
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
     }
+}
+
+/// `n` consecutive dynamic slots of `host` (the host heap behind the title
+/// heap at `heap`) for a list: out of what is left of the blocks the list
+/// took last, else out of new blocks (waited for if there are none,
+/// `HostHeap::dynamic_or_wait`), which go to `held` to be given back with the
+/// list's other slots. The longer rest is kept for the next ask.
+fn take_slots(
+    held: &mut Vec<(usize, u32, u32)>,
+    left: &mut (usize, u32, u32),
+    host: &crate::descriptor::host::HostHeap,
+    heap: usize,
+    n: u32,
+) -> Option<u32> {
+    if left.0 == heap && left.2 >= n {
+        // (Counted as asked like the tables that take new blocks.)
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
+        let first = left.1;
+        *left = (heap, first + n, left.2 - n);
+        return Some(first);
+    }
+    let taken = n.checked_next_multiple_of(crate::descriptor::host::DYNAMIC_GRAIN)?;
+    let first = host.dynamic_or_wait(taken)?;
+    held.push((heap, first, taken));
+    if left.0 != heap || taken - n > left.2 {
+        *left = (heap, first + n, taken - n);
+    }
+    Some(first)
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -1781,10 +1822,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic_or_wait(1) else {
+                let Some(index) = take_slots(&mut self.dynamic, &mut self.dynamic_left, host, key.0, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1852,10 +1892,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic_or_wait(1) else {
+                let Some(index) = take_slots(&mut self.dynamic, &mut self.dynamic_left, host, key.0, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3387,15 +3426,14 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic_or_wait(n) else {
+            let slots = take_slots(&mut self.dynamic, &mut self.dynamic_left, host, std::ptr::from_ref(heap) as usize, n);
+            let Some(first) = slots else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());

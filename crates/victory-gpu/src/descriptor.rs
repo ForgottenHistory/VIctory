@@ -1645,8 +1645,9 @@ mod tests {
             panic!("one fresh table for root parameter 1, not {:?}", &made[..]);
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
-        let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        // (The list packs its tables into the block it took: its next
+        // table would begin where this one ends.)
+        let next = state.next_dynamic_slot();
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(
