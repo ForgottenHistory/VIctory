@@ -113,6 +113,10 @@ foreach ($pair in ($Set | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 if ($NativeScale) {
     $settings.Remove('VICTORY_RENDER_SCALE'); $settings.Remove('VICTORY_OWN_UPSCALER')
+    # Local: no keep-awake spinner at the title's own resolution, where the card is busy all frame and the spinner
+    # only takes its time: 14 -> 16.3 fps live (VICTORY_CARD_AWAKE=turns), 54.5 -> 62.2 ms in a replayed frame with it.
+    # -Set VICTORY_CARD_AWAKE=1 (or =turns) brings it back.
+    if (-not ($Set -match 'VICTORY_CARD_AWAKE')) { $settings.VICTORY_CARD_AWAKE = '0' }
     Write-Host "Series $console, the title's own resolution (no render-scale or upscaler patch)"
 } else {
     $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
