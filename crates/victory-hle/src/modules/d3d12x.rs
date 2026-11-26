@@ -51,6 +51,13 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Opens the host so that the translator knows the card
+/// (`victory_gpu::shader_cache::open_host`).
+pub fn open_host() {
+    #[cfg(windows)]
+    victory_gpu::shader_cache::open_host();
+}
+
 /// The fork's offline warm-up (`victory translate --warm`), by
 /// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {

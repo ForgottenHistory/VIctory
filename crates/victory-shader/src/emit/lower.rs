@@ -1166,7 +1166,16 @@ pub(super) fn host_rdna() -> u32 {
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
-    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) || rdna_forced() { super::rdna_float() } else { 0 }
+}
+
+/// LOCAL, diagnostics: `VICTORY_RDNA_FORCE=1` (off by default) writes the
+/// console's float instructions as on an AMD RDNA host ([`super::rdna_float`]:
+/// `VICTORY_RDNA_FLOAT` picks which) on any card, to measure what the forms
+/// every host agrees on cost there. Results may differ in a zero's sign.
+fn rdna_forced() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RDNA_FORCE").is_some_and(|v| v == "1"))
 }
 
 /// The refusal of a first half of an interpolation whose result is read

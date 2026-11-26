@@ -111,6 +111,15 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// Opens the host as a run does, so that the translator knows the card
+/// (widest wave, AMD RDNA, the view heap's limit): `victory replay
+/// --retranslate` translates as a run on this card would.
+pub fn open_host() {
+    let _ = crate::host::host();
+    // The view heap's null slot, as the cache's key asks of it (`build`).
+    crate::descriptor::host::probe_view_limit();
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card

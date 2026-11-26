@@ -465,10 +465,20 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
-    victory_shader::emit::set_view_heap_limit(view_limit);
-    victory_shader::emit::set_raw_views(raw_views);
+    // As a run on this card translates: the host tells the translator its
+    // widest wave, whether it is AMD RDNA and its view heap's limit (this
+    // was 64 lanes and RDNA whatever the card). The options override.
+    victory_hle::modules::d3d12x::open_host();
+    if view_limit != 0 {
+        victory_shader::emit::set_view_heap_limit(view_limit);
+    }
+    if raw_views != 0 {
+        victory_shader::emit::set_raw_views(raw_views);
+    }
+    println!(
+        "translating for this card: [widest wave, view heap limit, raw views, RDNA float bits] {:?}",
+        victory_shader::emit::host_settings()
+    );
     let all: Vec<_> = wanted.iter().collect();
     let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let started = std::time::Instant::now();
