@@ -69,6 +69,10 @@ $settings = @{
     VICTORY_BVH_MISS = '1'
     # Memory compares on the card instead of the CPU: 11 -> about 22 fps on Series S.
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
+    # Local: every title buffer (64 KiB up) has its shaders' side in the card's memory. Under 1 MiB they were
+    # in the PC's, where each shader load and store crosses the bus: Series X native 78.9 -> 71.6 ms/frame live;
+    # a replayed frame 66 -> 49 ms without the passes that then compare them (shadow.rs card_limits).
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
 }

@@ -898,7 +898,14 @@ impl Player {
         for h in &self.frame.heaps {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
-                Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
+                // Diagnostics: `VICTORY_REPLAY_MOVE_HEAPS=1` moves the heaps only
+                // buffers lie in with `--only-buffers` too (windows of title
+                // memory in place are such heaps of the PC's memory).
+                Properties: props(
+                    &h.props,
+                    (only.is_empty() || std::env::var_os("VICTORY_REPLAY_MOVE_HEAPS").is_some_and(|v| v == "1"))
+                        && used_by_buffers_only.contains(&h.id),
+                ),
                 Alignment: h.alignment,
                 Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
             };
