@@ -158,7 +158,9 @@ if ($Nsight) {
     $envText = (($settings.Keys | Where-Object { $_ -ne 'VICTORY_SKIP_PIPELINES' } | Sort-Object | ForEach-Object { "$_=$($settings[$_])" }) -join '; ') + ';'
     $shown = ($runArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
     $ngArgs = @(
-        '--activity', 'GPU Trace Profiler', '--platform', 'Windows (x86_64)',
+        # (No --platform: Qt takes that option as its own and looks for a platform plugin named "Windows (x86_64)".
+        # The local machine is the default target.)
+        '--activity', 'GPU Trace Profiler',
         '--exe', (Resolve-Path $victory).Path, '--dir', $root, '--args', $shown, '--env', $envText,
         '--output-dir', $out, '--no-timeout',
         '--start-after-hotkey', '--limit-to-frames', '1', '--max-duration-ms', '3000',
