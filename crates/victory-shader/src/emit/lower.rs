@@ -109,6 +109,17 @@ pub(crate) fn nan_scrub() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_SCRUB").is_some_and(|v| v == "1"))
 }
 
+/// LOCAL, diagnostics: `VICTORY_NULL_SHADERS=1` (off by default) makes every
+/// translated program return as it starts. Its code stays behind a branch that
+/// is never taken, so it validates and binds as before, and every draw and
+/// dispatch is still made with its state: what the card then spends on a frame
+/// is all but the programs' own work (commands, barriers, copies, our passes),
+/// the floor faster translated programs could reach. The picture is garbage.
+pub(crate) fn null_shaders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_SHADERS").is_some_and(|v| v == "1"))
+}
+
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -2351,6 +2362,23 @@ impl<'a> Lower<'a> {
             let runs = self.s.m.bin(original, Bin::Or, all, inside);
             let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
             self.s.m.terminate(original, Term::CondBr(runs, body, done));
+            self.s.m.terminate(done, Term::Ret);
+            self.s.entry = body;
+        }
+        if null_shaders() {
+            // Diagnostics: return at once; the program stays behind a branch
+            // never taken (`null_shaders`).
+            // The condition is true on every card, but not to the validator
+            // (a constant one leaves the program's outputs unwritten to it):
+            // the wave has a lane.
+            let original = self.s.entry;
+            let i32t = self.s.t.i32;
+            let lanes = self.s.op(original, "waveGetLaneCount", Attr::ReadOnly, i32t, 112, &[]);
+            self.s.flags |= flags::WAVE_OPS;
+            let zero = self.s.m.i32(0);
+            let always = self.s.m.cmp(original, pred::NE, lanes, zero);
+            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(original, Term::CondBr(always, done, body));
             self.s.m.terminate(done, Term::Ret);
             self.s.entry = body;
         }
