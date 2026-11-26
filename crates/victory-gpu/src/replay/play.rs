@@ -926,8 +926,11 @@ impl Player {
                 let seen = gpu::seen(props);
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
-                let plain: String = r.name.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
-                let plain = plain.split('#').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("#");
+                // An address in a name: its first three hex digits.
+                let plain = match r.name.split_once("0x") {
+                    Some((head, tail)) => format!("{head}0x{}..", &tail[..tail.len().min(3)]),
+                    None => r.name.clone(),
+                };
                 let m = named.entry(format!("{seen:?} \"{plain}\"")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
