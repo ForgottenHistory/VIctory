@@ -30,6 +30,9 @@ param(
     [ValidateSet('0', '1', '2')][string]$CardSteps,
     # Local: open PIX with these settings in its environment instead of starting the game (PIX launches it).
     [switch]$Pix,
+    # Local: start the game under Nsight Graphics' GPU Trace with the real-time shader profiler (ngfx.exe), the trace of
+    # one frame started with F11 in the game; the report goes to C:\Games\xbox\captures\nsight.
+    [switch]$Nsight,
     # Local: disarm the title's watchdog (VICTORY_NO_WATCHDOG; on with -Pix). It ends the process, by a write to address
     # 0 at image+0x23cf683, when the main thread has not advanced for about 30 s: a capture or a long stall trips it.
     [switch]$NoWatchdog,
@@ -96,7 +99,7 @@ if ($Resolution) {
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 if ($CardSteps) { $settings.VICTORY_CARD_STEPS = $CardSteps }
-if ($NoWatchdog -or $Pix) { $settings.VICTORY_NO_WATCHDOG = '1' }
+if ($NoWatchdog -or $Pix -or $Nsight) { $settings.VICTORY_NO_WATCHDOG = '1' }
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
     $name, $value = $pair -split '=', 2
     if (-not $name -or $null -eq $value) { Write-Host "-Set wants NAME=VALUE, not '$pair'."; return }
@@ -141,6 +144,30 @@ if ($Pix) {
     Write-Host "Tick 'For GPU capture', then Launch. In the game: load the save, stand still, press Print Screen once."
     Write-Host "Save the capture in C:\Games\xbox\captures."
     Start-Process $pixExe.FullName -WorkingDirectory $root
+    return
+}
+if ($Nsight) {
+    $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $ngfx = Get-ChildItem 'C:\Program Files\NVIDIA Corporation\Nsight Graphics *\host\windows-desktop-nomad-x64\ngfx.exe' |
+        Sort-Object FullName | Select-Object -Last 1
+    if (-not $ngfx) { Write-Host "No Nsight Graphics (ngfx.exe) found."; return }
+    $out = 'C:\Games\xbox\captures\nsight'
+    New-Item -ItemType Directory -Force $out | Out-Null
+    # The settings are in this process's environment (above), which the game inherits; --env repeats them, all but the
+    # long skip list, in case ngfx starts it with an environment of its own.
+    $envText = (($settings.Keys | Where-Object { $_ -ne 'VICTORY_SKIP_PIPELINES' } | Sort-Object | ForEach-Object { "$_=$($settings[$_])" }) -join '; ') + ';'
+    $shown = ($runArgs | ForEach-Object { if ($_ -match ' ') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $ngArgs = @(
+        '--activity', 'GPU Trace Profiler', '--platform', 'Windows (x86_64)',
+        '--exe', (Resolve-Path $victory).Path, '--dir', $root, '--args', $shown, '--env', $envText,
+        '--output-dir', $out, '--no-timeout',
+        '--start-after-hotkey', '--limit-to-frames', '1', '--max-duration-ms', '3000',
+        '--real-time-shader-profiler', '--auto-export'
+    )
+    Write-Host "Nsight GPU Trace: $($ngfx.FullName)"
+    Write-Host "In the game: load the save, stand still, press F11 once. The trace and its export go to $out."
+    & $ngfx.FullName @ngArgs
+    Write-Host "ngfx exit code $LASTEXITCODE."
     return
 }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
