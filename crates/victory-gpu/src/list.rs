@@ -2191,7 +2191,7 @@ static BARRIER_CALLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::at
 /// # Safety
 /// `groups` holds `count` `D3D12_BARRIER_GROUP`s whose barrier arrays are live.
 #[cfg(all(windows, feature = "diagnostics"))]
-unsafe fn note_barrier_kinds(count: u32, groups: *const u8) {
+pub(crate) unsafe fn note_barrier_kinds(count: u32, groups: *const u8) {
     use std::sync::atomic::Ordering::Relaxed;
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,

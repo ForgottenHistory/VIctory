@@ -548,6 +548,13 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    // Diagnostics: what they ask for is read here, on the title's thread (the groups
+    // are not recorded: the barrier is one on every shader write).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if count > 0 {
+        // SAFETY: the title passes `count` groups in the D3D12 layout.
+        unsafe { super::note_barrier_kinds(count, _groups) };
+    }
     front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
