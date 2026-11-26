@@ -535,6 +535,7 @@ fn record_clamp_as(
         ),
     ];
     let skip = usize::from(!waits);
+    crate::host::pix_begin(l, "ours: indirect clamp");
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -550,6 +551,7 @@ fn record_clamp_as(
         }
         l.ResourceBarrier(&second[skip..]);
     }
+    crate::host::pix_end(l);
     true
 }
 

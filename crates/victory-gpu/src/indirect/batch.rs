@@ -276,6 +276,7 @@ pub(super) fn record(
     );
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
+    crate::host::pix_begin(l, "ours: indirect clamp");
     unsafe {
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -294,4 +295,5 @@ pub(super) fn record(
         // (the budget, by the next pass): only the records have to be there.
         l.ResourceBarrier(&[after]);
     }
+    crate::host::pix_end(l);
 }

@@ -1694,6 +1694,36 @@ fn record_twin_copy(
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
+/// Whether PIX regions name the layer's own GPU work (`VICTORY_PIX_MARKERS=1`,
+/// diagnostics builds): a GPU capture then tells, in a normal frame (lists
+/// not run one at a time as `VICTORY_GPU_TIMING` does), how much of the
+/// card's time is the title's commands and how much ours. Regions: each host
+/// list ("list", its close "ours: list close"), and our lists and passes
+/// ("ours: ..."). A command belongs to the innermost region around it.
+pub(crate) fn pix_markers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_PIX_MARKERS"))
+}
+
+/// Opens a PIX region named `name` in `list` (open), with [`pix_markers`].
+pub(crate) fn pix_begin(list: &ID3D12GraphicsCommandList, name: &str) {
+    if !pix_markers() {
+        return;
+    }
+    let text: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    const UNICODE: u32 = 0;
+    // SAFETY: an open list; the text is copied when recorded.
+    unsafe { list.BeginEvent(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32) };
+}
+
+/// Closes the region [`pix_begin`] opened last in `list`.
+pub(crate) fn pix_end(list: &ID3D12GraphicsCommandList) {
+    if pix_markers() {
+        // SAFETY: an open list with a region open.
+        unsafe { list.EndEvent() };
+    }
+}
+
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED") && !dred_faults() && !dred_light())
@@ -4072,6 +4102,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
+            pix_begin(&list, "list");
             let prelude = OnceLock::new();
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
@@ -4316,6 +4347,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    pix_begin(list, "ours: card copies+hashes");
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4389,6 +4421,7 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    pix_end(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4471,6 +4504,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    pix_begin(list, "ours: card compares");
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4495,6 +4529,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    pix_end(list);
                     list.Close()?;
                     list.cast()
                 })()
@@ -4737,9 +4772,11 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                pix_begin(&list, "ours: copy-back fetch");
                 for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                pix_end(&list);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
@@ -5043,9 +5080,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    pix_begin(list, "ours: copy-back fetch");
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    pix_end(list);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -6188,6 +6227,8 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        pix_end(&self.list);
+        pix_begin(&self.list, "ours: list close");
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6206,6 +6247,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        pix_end(&self.list);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -6271,6 +6313,7 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        pix_begin(&self.list, "list");
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
@@ -6626,6 +6669,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                pix_begin(list, "ours: state prelude");
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -6635,6 +6679,7 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                pix_end(list);
                 list.Close()
             })
         };
