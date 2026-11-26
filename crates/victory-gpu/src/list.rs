@@ -2157,6 +2157,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
+        // SAFETY: the title passes `count` groups in the D3D12 layout.
+        unsafe { note_barrier_kinds(count, _groups) };
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
@@ -2175,6 +2177,102 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// Diagnostics: what the title's enhanced barriers ask for, by kind, since the
+/// last frame-rate line ([`log_barrier_kinds`]): (barrier type, sync before,
+/// sync after, access before, access after, layout before, layout after) ->
+/// barriers; and the calls by how many barriers they held.
+#[cfg(all(windows, feature = "diagnostics"))]
+static BARRIER_KINDS: std::sync::Mutex<Option<std::collections::HashMap<(u32, u32, u32, u32, u32, u32, u32), u64>>> = std::sync::Mutex::new(None);
+#[cfg(all(windows, feature = "diagnostics"))]
+static BARRIER_CALLS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// # Safety
+/// `groups` holds `count` `D3D12_BARRIER_GROUP`s whose barrier arrays are live.
+#[cfg(all(windows, feature = "diagnostics"))]
+unsafe fn note_barrier_kinds(count: u32, groups: *const u8) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_BARRIER_GROUP, D3D12_BUFFER_BARRIER, D3D12_GLOBAL_BARRIER, D3D12_TEXTURE_BARRIER,
+    };
+    if groups.is_null() {
+        return;
+    }
+    // SAFETY: from this function's contract.
+    let groups = unsafe { std::slice::from_raw_parts(groups.cast::<D3D12_BARRIER_GROUP>(), count as usize) };
+    let mut kinds = Vec::new();
+    for g in groups {
+        let n = g.NumBarriers as usize;
+        // SAFETY: the union member the type names, `n` of them.
+        unsafe {
+            match g.Type.0 {
+                0 if !g.Anonymous.pGlobalBarriers.is_null() => {
+                    for b in std::slice::from_raw_parts::<D3D12_GLOBAL_BARRIER>(g.Anonymous.pGlobalBarriers, n) {
+                        kinds.push((0, b.SyncBefore.0 as u32, b.SyncAfter.0 as u32, b.AccessBefore.0 as u32, b.AccessAfter.0 as u32, 0, 0));
+                    }
+                }
+                1 if !g.Anonymous.pTextureBarriers.is_null() => {
+                    for b in std::slice::from_raw_parts::<D3D12_TEXTURE_BARRIER>(g.Anonymous.pTextureBarriers, n) {
+                        kinds.push((
+                            1,
+                            b.SyncBefore.0 as u32,
+                            b.SyncAfter.0 as u32,
+                            b.AccessBefore.0 as u32,
+                            b.AccessAfter.0 as u32,
+                            b.LayoutBefore.0 as u32,
+                            b.LayoutAfter.0 as u32,
+                        ));
+                    }
+                }
+                2 if !g.Anonymous.pBufferBarriers.is_null() => {
+                    for b in std::slice::from_raw_parts::<D3D12_BUFFER_BARRIER>(g.Anonymous.pBufferBarriers, n) {
+                        kinds.push((2, b.SyncBefore.0 as u32, b.SyncAfter.0 as u32, b.AccessBefore.0 as u32, b.AccessAfter.0 as u32, 0, 0));
+                    }
+                }
+                t => kinds.push((t as u32 | 0x100, 0, 0, 0, 0, 0, 0)),
+            }
+        }
+    }
+    BARRIER_CALLS[0].fetch_add(1, Relaxed);
+    BARRIER_CALLS[1].fetch_add(kinds.len() as u64, Relaxed);
+    if kinds.is_empty() {
+        BARRIER_CALLS[2].fetch_add(1, Relaxed);
+    }
+    let mut all = BARRIER_KINDS.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(Default::default);
+    for k in kinds {
+        *all.entry(k).or_default() += 1;
+    }
+}
+
+/// For the frame-rate line: the title's enhanced barriers by kind, the most
+/// common first ([`note_barrier_kinds`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn log_barrier_kinds(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [calls, barriers, empty] = [0, 1, 2].map(|i| BARRIER_CALLS[i].swap(0, Relaxed) as f64 / frames);
+    let Some(all) = BARRIER_KINDS.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut all: Vec<_> = all.into_iter().collect();
+    all.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    tracing::info!(
+        "  the title's enhanced barriers, per frame: {calls:.0} calls, {barriers:.0} barriers, {empty:.1} calls with none; {} kinds, the most common follow",
+        all.len()
+    );
+    for ((kind, sb, sa, ab, aa, lb, la), n) in all.into_iter().take(16) {
+        let kind = match kind {
+            0 => "global".to_owned(),
+            1 => "texture".to_owned(),
+            2 => "buffer".to_owned(),
+            k => format!("type {}", k & 0xff),
+        };
+        tracing::info!(
+            "  barrier kind {:.1}/frame: {kind} sync {sb:#x} -> {sa:#x}, access {ab:#x} -> {aa:#x}, layout {lb} -> {la}",
+            n as f64 / frames
+        );
+    }
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

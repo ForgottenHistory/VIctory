@@ -1352,6 +1352,8 @@ pub(crate) fn log(frames: f64) {
         c[C::IndirectBounded as usize],
         barrier_test()
     );
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::list::log_barrier_kinds(frames);
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
